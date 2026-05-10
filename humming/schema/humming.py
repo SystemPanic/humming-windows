@@ -232,7 +232,7 @@ class HummingWeightSchema(BaseWeightSchema):
                 schema.bs_dtype = dtypes.DataType.from_torch_dtype(param_dtype)
                 del tensors["global_scale"]
 
-        return self, tensors
+        return schema, tensors
 
 
 @dataclasses.dataclass(kw_only=True)
