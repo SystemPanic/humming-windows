@@ -6,6 +6,7 @@ from humming.kernel.humming import HummingKernel
 from humming.utils.test import (
     generate_random_inputs,
     generate_random_weight,
+    skip_if_unsupported,
 )
 from humming.utils.weight import (
     prepare_humming_weight,
@@ -41,6 +42,7 @@ def test_scale(
     weight_scale_group_size,
     mma_type,
 ):
+    skip_if_unsupported(a_dtype=a_dtype, mma_type=mma_type)
     a_dtype = dtypes.DataType.from_str(a_dtype)
     b_dtype = dtypes.DataType.from_str(b_dtype)
     c_dtype = dtypes.DataType.from_str(c_dtype)
@@ -161,6 +163,7 @@ def test_global_scale(
     weight_scale_group_size,
     use_f16_accum,
 ):
+    skip_if_unsupported(a_dtype=a_dtype)
     a_dtype = dtypes.DataType.from_str(a_dtype)
     b_dtype = dtypes.DataType.from_str(b_dtype)
     c_dtype = dtypes.DataType.from_str(c_dtype)
@@ -288,6 +291,7 @@ def test_int_weight_scale(
     weight_scale_group_size,
     has_global_scale,
 ):
+    skip_if_unsupported(a_dtype=a_dtype)
     a_dtype = dtypes.DataType.from_str(a_dtype)
     b_dtype = dtypes.DataType.from_str(b_dtype)
     c_dtype = dtypes.DataType.from_str(c_dtype)
@@ -402,6 +406,7 @@ def test_int_weight_scale(
 def test_fused_e8m0_weight_scale(c_dtype, weight_scale_group_size, has_global_scale):
     a_dtype = dtypes.float8e4m3
     b_dtype = dtypes.float4e2m1
+    skip_if_unsupported(a_dtype=a_dtype)
     c_dtype = dtypes.DataType.from_str(c_dtype)
     bs_dtype = dtypes.float8e8m0
 
@@ -500,6 +505,7 @@ def test_block_scale(
     use_f16_accum,
     mma_type,
 ):
+    skip_if_unsupported(a_dtype=a_dtype, mma_type=mma_type)
     a_dtype = dtypes.DataType.from_str(a_dtype)
     b_dtype = dtypes.DataType.from_str(b_dtype)
     c_dtype = dtypes.DataType.from_str(c_dtype)

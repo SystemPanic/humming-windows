@@ -7,6 +7,7 @@ from humming.kernel.humming import HummingKernel
 from humming.utils.test import (
     generate_random_inputs,
     generate_random_weight,
+    skip_if_unsupported,
 )
 from humming.utils.weight import (
     prepare_humming_weight,
@@ -26,6 +27,7 @@ def test_batch_invariance(
     weight_scale_group_size,
     mma_type,
 ):
+    skip_if_unsupported(a_dtype=a_dtype, mma_type=mma_type)
     c_dtype = dtypes.bfloat16
     a_dtype = dtypes.DataType.from_str(a_dtype)
     b_dtype = dtypes.DataType.from_str(b_dtype)

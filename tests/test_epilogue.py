@@ -3,7 +3,12 @@ import torch
 
 from humming import dtypes, ops
 from humming.kernel.humming import HummingKernel
-from humming.utils.test import generate_random_bias, generate_random_inputs, generate_random_weight
+from humming.utils.test import (
+    generate_random_bias,
+    generate_random_inputs,
+    generate_random_weight,
+    skip_if_unsupported,
+)
 from humming.utils.weight import (
     prepare_humming_bias,
     prepare_humming_weight,
@@ -14,6 +19,7 @@ from humming.utils.weight import (
 @pytest.mark.parametrize("a_dtype", ["float16", "bfloat16", "float8e4m3", "int8", "int4"])
 @pytest.mark.parametrize("c_dtype", ["float16", "bfloat16"])
 def test_bias(a_dtype, c_dtype):
+    skip_if_unsupported(a_dtype=a_dtype)
     c_dtype = dtypes.DataType.from_str(c_dtype)
     a_dtype = dtypes.DataType.from_str(a_dtype)
     b_dtype = dtypes.uint3

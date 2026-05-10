@@ -5,7 +5,12 @@ import torch
 
 from humming import dtypes, ops
 from humming.kernel.humming import HummingKernel
-from humming.utils.test import generate_random_bias, generate_random_inputs, generate_random_weight
+from humming.utils.test import (
+    generate_random_bias,
+    generate_random_inputs,
+    generate_random_weight,
+    skip_if_unsupported,
+)
 from humming.utils.weight import (
     prepare_humming_bias,
     prepare_humming_weight,
@@ -39,6 +44,14 @@ def test_pipeline(
     use_cp_async,
     use_tma,
 ):
+    skip_if_unsupported(
+        a_dtype=a_dtype,
+        mma_type=mma_type,
+        use_cp_async=use_cp_async,
+        use_tma=bool(use_tma),
+        use_warp_spec=use_warp_spec,
+        use_mbarrier=use_mbarrier,
+    )
     a_dtype = dtypes.DataType.from_str(a_dtype)
     b_dtype = dtypes.DataType.from_str(b_dtype)
     c_dtype = dtypes.DataType.from_str(c_dtype)
@@ -174,6 +187,7 @@ def test_write_splits(
     mma_type,
     num_write_splits,
 ):
+    skip_if_unsupported(a_dtype=a_dtype, mma_type=mma_type)
     a_dtype = dtypes.DataType.from_str(a_dtype)
     b_dtype = dtypes.DataType.from_str(b_dtype)
     c_dtype = dtypes.DataType.from_str(c_dtype)

@@ -3,7 +3,11 @@ import torch
 
 from humming import dtypes, ops
 from humming.kernel.humming import HummingKernel
-from humming.utils.test import generate_random_inputs, generate_random_weight
+from humming.utils.test import (
+    generate_random_inputs,
+    generate_random_weight,
+    skip_if_unsupported,
+)
 from humming.utils.weight import (
     prepare_humming_weight,
     prepare_humming_weight_scale,
@@ -46,6 +50,7 @@ from humming.utils.weight import (
 )
 @pytest.mark.parametrize("c_dtype", ["float16", "bfloat16"])
 def test_datatype(a_dtype, b_dtype, c_dtype):
+    skip_if_unsupported(a_dtype=a_dtype)
     a_dtype = dtypes.DataType.from_str(a_dtype)
     b_dtype = dtypes.DataType.from_str(b_dtype)
     c_dtype = dtypes.DataType.from_str(c_dtype)
