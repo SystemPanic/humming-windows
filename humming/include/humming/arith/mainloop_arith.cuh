@@ -87,6 +87,15 @@ public:
 
   CUDA_INLINE
   void may_process_bs_before_apply_on_b(uint32_t j, uint32_t buffer_id) {
+
+    if (j == 0) {
+      if constexpr (ElementA::kBits == 16 && kIsBlockWeightScale) {
+        scalar_t2 *dq_bs_scalar2_ptr = reinterpret_cast<scalar_t2 *>(dq_bs);
+        float bs_float = reinterpret_cast<float*>(bs[buffer_id])[0];
+        dq_bs_scalar2_ptr[0] = this->float2num2(bs_float);
+      }
+    }
+
     if (j % 2 == 0) {
       if constexpr (ElementA::kBits == 16 && ElementBS::kBits == 8 && kIsGroupWeightScale && !kUseFusedE8m0Scale) {
         dequant<ElementBS, ElementA>(bs[buffer_id], dq_bs, 0);
@@ -128,7 +137,7 @@ public:
     }
 
     // apply bs and/or zp only when we use fp16/bf16 activation.
-    if constexpr (ElementA::kBits == 16 && (kIsGroupWeightScale || kIsFpZeroPoint)) {
+    if constexpr (ElementA::kBits == 16 && (kIsGroupWeightScale || kIsBlockWeightScale || kIsFpZeroPoint)) {
 
       scalar_t2 *b_f16_ptr = reinterpret_cast<scalar_t2 *>(regs_b);
       scalar_t2 bs_f16_ptr[2];
@@ -178,6 +187,11 @@ public:
             scalar_t2 bs_single = bs_f16_ptr[MmaOpClass::kMmaType == MmaType::WGMMA ? k : i];
             b_f16_ptr[i * 2 + k] = __hmul2(b_f16_ptr[i * 2 + k], bs_single);
           }
+          if constexpr (kIsBlockWeightScale) {
+            scalar_t2 bs_single = reinterpret_cast<scalar_t2*>(dq_bs)[0];
+            b_f16_ptr[i * 2 + k] = __hmul2(b_f16_ptr[i * 2 + k], bs_single);
+          }
+
         };
       };
     };

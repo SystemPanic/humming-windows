@@ -484,7 +484,7 @@ def test_fused_e8m0_weight_scale(c_dtype, weight_scale_group_size, has_global_sc
     torch.testing.assert_close(outputs, outputs_ref, rtol=0.05, atol=0.5)
 
 
-@pytest.mark.parametrize("a_dtype", ["float8e4m3", "int8", "int4"])
+@pytest.mark.parametrize("a_dtype", ["float16", "bfloat16", "float8e4m3", "int8", "int4"])
 @pytest.mark.parametrize("b_dtype", ["uint3", "int8", "float4e1m2", "float8e1m6"])
 @pytest.mark.parametrize("c_dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("block_shape", [(128, 128), (256, 64), (64, 32), (256, 512), (64, 64)])
@@ -595,7 +595,25 @@ def test_block_scale(
     )
 
     if a_dtype.num_bits == 16 and weight_scale.size(-2) > 1:
-        weight_ref = weight_ref.to(torch_dtype).float()
+        ws_full = (
+            weight_scale.transpose(-1, -2)
+            .repeat_interleave(block_shape[0], -2)
+            .repeat_interleave(weight_scale_group_size, -1)
+            .float()
+        )
+        weight_ref_no_scale = weight_ref / ws_full
+        weight_ref = weight_ref_no_scale.to(torch_dtype) * ws_full.to(torch_dtype)
+        weight_ref = weight_ref.float()
 
-    outputs_ref = inputs_ref.matmul(weight_ref.T).to(torch_dtype)
-    torch.testing.assert_close(outputs, outputs_ref, rtol=0.05, atol=0.2)
+    atol = 0.2
+    if a_dtype.num_bits == 16 and use_f16_accum:
+        prev_fp16_accum = torch.backends.cuda.matmul.allow_fp16_accumulation
+        torch.backends.cuda.matmul.allow_fp16_accumulation = True
+        try:
+            outputs_ref = inputs_ref.to(torch_dtype).matmul(weight_ref.to(torch_dtype).T).to(torch_dtype)
+        finally:
+            torch.backends.cuda.matmul.allow_fp16_accumulation = prev_fp16_accum
+        atol = 0.5
+    else:
+        outputs_ref = inputs_ref.matmul(weight_ref.T).to(torch_dtype)
+    torch.testing.assert_close(outputs, outputs_ref, rtol=0.05, atol=atol)

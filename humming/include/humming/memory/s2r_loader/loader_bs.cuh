@@ -52,7 +52,6 @@ public:
 
   CUDA_INLINE
   void load_block(const int4 *smem_ptr, uint32_t *regs_ptr, int32_t iter_id) {
-    static_assert(ElementA::kBits != 16);
     static_assert(kGroupSizeN >= 64);
 
     uint32_t warp_id = threadIdx.x / 32;

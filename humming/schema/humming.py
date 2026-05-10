@@ -16,7 +16,7 @@ class HummingWeightSchema(BaseWeightSchema):
     bs_dtype: dtypes.DataType | None = None
     weight_scale_group_size: int = 0
     weight_scale_group_size_n: int = 0
-    weight_scale_type: WeightScaleType | None = None
+    weight_scale_type: WeightScaleType | str | None = None
     has_zero_point: bool = False
     is_fp_zero_point: bool = False
 
@@ -37,7 +37,9 @@ class HummingWeightSchema(BaseWeightSchema):
         if isinstance(self.bs_dtype, str):
             self.bs_dtype = dtypes.DataType.from_str(str(self.bs_dtype))
 
-        if self.weight_scale_type is None:
+        if isinstance(self.weight_scale_type, str):
+            self.weight_scale_type = WeightScaleType(self.weight_scale_type)
+        elif self.weight_scale_type is None:
             if self.weight_scale_group_size_n > 1:
                 self.weight_scale_type = WeightScaleType.BLOCK
             elif self.weight_scale_group_size == 0:
@@ -196,6 +198,40 @@ class HummingWeightSchema(BaseWeightSchema):
         param_dtype: torch.dtype,
         num_experts: int | None = None,
     ) -> tuple["HummingWeightSchema", dict[str, torch.Tensor]]:
+        schema = dataclasses.replace(self)
+        if self.weight_scale_type in [WeightScaleType.GROUP, WeightScaleType.CHANNEL]:
+            if tensors["weight_scale"].dtype == torch.float32:
+                tensors["weight_scale"] = tensors["weight_scale"].to(param_dtype)
+            if self.bs_dtype == dtypes.float32:
+                schema.bs_dtype = dtypes.DataType.from_torch_dtype(param_dtype)
+        elif self.weight_scale_type == WeightScaleType.BLOCK:
+            tensors["weight_scale"] = tensors["weight_scale"].to(torch.float32)
+            schema.bs_dtype = dtypes.float32
+        elif self.weight_scale_type in [WeightScaleType.TENSOR, WeightScaleType.GROUP_TENSOR]:
+            global_scale = tensors["global_scale"].view(num_experts or 1, -1)
+            global_scale = self._may_process_global_scale(
+                global_scale,
+                shape_n_stacks=shape_n_stacks,
+                shape_k_stacks=shape_k_stacks,
+                num_experts=num_experts,
+                target_group_size=schema.weight_scale_group_size,
+            )
+
+            if global_scale.nelement() == (num_experts or 1):
+                tensors["global_scale"] = global_scale.to(torch.float32)
+                schema.bs_dtype = dtypes.float32
+            elif self.weight_scale_type == WeightScaleType.TENSOR:
+                schema.weight_scale_type = WeightScaleType.CHANNEL
+                schema.bs_dtype = dtypes.DataType.from_torch_dtype(param_dtype)
+                tensors["weight_scale"] = global_scale.to(param_dtype)
+                del tensors["global_scale"]
+            elif self.weight_scale_type == WeightScaleType.GROUP_TENSOR:
+                schema.weight_scale_type = WeightScaleType.GROUP
+                weight_scale = tensors["weight_scale"].float() * global_scale.float()
+                tensors["weight_scale"] = weight_scale.to(param_dtype)
+                schema.bs_dtype = dtypes.DataType.from_torch_dtype(param_dtype)
+                del tensors["global_scale"]
+
         return self, tensors
 
 
