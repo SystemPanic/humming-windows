@@ -37,7 +37,7 @@ def register_op(
         _lib._register_fake(op_name, fake_impl_func)
 
 
-def get_humming_launcher_build_dir():
+def get_humming_launcher_build_dir(use_torch_stable_api: bool):
     import humming
 
     dirname = os.path.dirname(humming.__file__)
@@ -50,15 +50,38 @@ def get_humming_launcher_build_dir():
     py_version = f"py{sys.version_info.major}{sys.version_info.minor}"
     torch_major, torch_minor = torch.__version__.split(".")[:2]
     torch_version = f"torch{torch_major}{torch_minor}"
-    version = py_version + "_" + torch_version
+    abi_tag = "stable" if use_torch_stable_api else "nostable"
+    version = f"{py_version}_{torch_version}_{abi_tag}"
 
     launcher_build_dir = os.path.join(cache_dir, f"launcher/{version}/{launcher_code_hash}")
     Path(launcher_build_dir).mkdir(exist_ok=True, parents=True)
     return launcher_build_dir
 
 
-def init_humming_launcher():
+def _resolve_use_torch_stable_api() -> bool:
+    """Decide whether to compile the launcher with the torch stable C ABI.
+
+    Defaults to enabled for torch >= 2.11, which is the first release whose
+    stable ABI registers all ScalarType cases humming relies on, including
+    Float8_e8m0fnu (added in pytorch/pytorch#173669, gated by
+    TORCH_FEATURE_VERSION >= TORCH_VERSION_2_11_0). On torch 2.10.x the
+    stable ABI is missing Float8_e8m0fnu (ScalarType 44), so passing a
+    UE8M0 weight scale through ``torch.ops.humming.launch_kernel`` fails
+    with ``RuntimeError: Not yet supported ScalarType 44``.
+
+    The default can be overridden via the ``HUMMING_USE_TORCH_STABLE_API``
+    environment variable for users who want to force one path or the other
+    (e.g. to test the stable ABI on an older torch with a custom build).
+    """
     from packaging.version import Version
+
+    override = os.environ.get("HUMMING_USE_TORCH_STABLE_API")
+    if override is not None:
+        return override.strip().lower() in ("1", "true", "yes", "on")
+    return Version(torch.__version__) >= Version("2.11")
+
+
+def init_humming_launcher():
     from torch.library import register_fake
 
     from humming.config import GemmType
@@ -68,12 +91,12 @@ def init_humming_launcher():
     if _launcher_inited:
         return
 
-    USE_TORCH_STABLE_API = Version(torch.__version__) >= Version("2.10")
+    USE_TORCH_STABLE_API = _resolve_use_torch_stable_api()
     lock_filename = jit_utils.get_humming_lock_filename("launcher")
     with FileLock(lock_filename):
         import humming
 
-        build_dir = get_humming_launcher_build_dir()
+        build_dir = get_humming_launcher_build_dir(USE_TORCH_STABLE_API)
         torch_lock_file = os.path.join(build_dir, "lock")
         if os.path.exists(torch_lock_file):
             os.unlink(torch_lock_file)
