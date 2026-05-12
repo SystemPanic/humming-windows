@@ -25,20 +25,21 @@ public:
 template <class MmaOpClass, uint32_t kRepeatCount, uint32_t kUnrollCount>
 __global__ void tops_bench(uint32_t *out_ptr) {
 
-  typename MmaOpClass::ARegisters regs_a;
   typename MmaOpClass::CRegisters regs_c;
 
   if constexpr (MmaOpClass::kMmaType == MmaType::WGMMA) {
+    typename MmaOpClass::BRegisters regs_b;
     __shared__ alignas(1024) int4 smem[2048];
     uint64_t desc = make_wgmma_smem_desc<128>(smem, 0);
     PRAGMA_UNROLL_COUNT(kUnrollCount)
     for (uint32_t i = 0; i < kRepeatCount; i++) {
       wgmma_fence();
-      MmaOpClass::fma(regs_a, desc, regs_c);
+      MmaOpClass::fma(desc, regs_b, regs_c);
       wgmma_commit();
       wgmma_wait<0>();
     }
   } else {
+    typename MmaOpClass::ARegisters regs_a;
     typename MmaOpClass::BRegisters regs_b;
     PRAGMA_UNROLL_COUNT(kUnrollCount)
     for (uint32_t i = 0; i < kRepeatCount; i++)

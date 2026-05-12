@@ -45,8 +45,8 @@ public:
   SharedStorage &smem;
   ArithClass &arith;
   uint32_t regs_qb[2][ElementB::kBits * (16 / ElementA::kBits)];
-  typename MmaOpClass::ARegisters regs_b[2][WarpShape::N * 4 / MmaShape::M][kPartMmaShapeK / MmaShape::K];
-  typename MmaOpClass::CRegisters regs_c[2][WarpShape::N * 4 / MmaShape::M][WarpShape::M / MmaShape::N];
+  typename MmaOpClass::BRegisters regs_b[2][WarpShape::N * 4 / MmaShape::N][kPartMmaShapeK / MmaShape::K];
+  typename MmaOpClass::CRegisters regs_c[2][WarpShape::N * 4 / MmaShape::N][WarpShape::M / MmaShape::M];
   uint32_t smem_offset = 0;
 
   CUDA_INLINE
@@ -89,8 +89,8 @@ public:
       }
 
       PRAGMA_UNROLL
-      for (uint32_t i = 0; i < WarpShape::N / (MmaShape::M / 4); i++) {
-        uint32_t *regs_b_ptr = reinterpret_cast<uint32_t *>(regs_b[buffer_id][i * 64 / MmaShape::M]);
+      for (uint32_t i = 0; i < WarpShape::N / (MmaShape::N / 4); i++) {
+        uint32_t *regs_b_ptr = reinterpret_cast<uint32_t *>(regs_b[buffer_id][i * 64 / MmaShape::N]);
         uint4 zp_vals = arith.prepare_zp_for_dequant(buffer_id, i);
         uint32_t *zp_vals_ptr = reinterpret_cast<uint32_t *>(&zp_vals);
         dequant<ElementB, ElementA, kHasZeroPoint, kIsFpZeroPoint, kNumWarpShapeNSplits>(regs_qb[buffer_id], regs_b_ptr, i, zp_vals_ptr);
@@ -101,7 +101,7 @@ public:
 
   CUDA_INLINE
   void run(uint32_t stage_id, uint32_t iter_id) {
-    static_assert(WarpShape::M == MmaShape::N);
+    static_assert(WarpShape::M == MmaShape::M);
     uint32_t buffer_id = iter_id % 2;
 
     PRAGMA_UNROLL
@@ -109,7 +109,7 @@ public:
       int4 *smem_ptr = smem.a[stage_id] + smem_offset + iter_id * 2 + k;
       uint64_t desc = make_wgmma_smem_desc<kSwizzleBytes>(smem_ptr, iter_id);
 
-      constexpr uint32_t kNumIters = WarpShape::N / (MmaShape::M / 4);
+      constexpr uint32_t kNumIters = WarpShape::N / (MmaShape::N / 4);
 
       bool scale_d = true;
       constexpr bool kApplyScaleOnC = ElementA::kBits != 16 && (LayerConfig::kInputScaleGroupSize > 0 || LayerConfig::kWeightScaleGroupSize > 0);
@@ -124,7 +124,7 @@ public:
       PRAGMA_UNROLL
       for (uint32_t j = 0; j < kNumIters; j++) {
         if constexpr (kApplyScaleOnC) fence_regs(regs_c[0][j][0]);
-        MmaOpClass::fma(regs_b[buffer_id][j][k], desc, regs_c[0][j][0], scale_d);
+        MmaOpClass::fma(desc, regs_b[buffer_id][j][k], regs_c[0][j][0], scale_d);
         wgmma_commit();
         wgmma_wait<0>();
         if constexpr (kApplyScaleOnC) fence_regs(regs_c[0][j][0]);

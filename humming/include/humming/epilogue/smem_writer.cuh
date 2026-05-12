@@ -83,7 +83,7 @@ private:
   using ValTypeC = typename MmaOpClass::ValTypeC;
   using CRegistersType = typename MmaOpClass::CRegisters;
   using MMA_CRegistersArrayType = CRegistersType[MAX(WarpShape::M / MmaShape::M, 1)][MAX(WarpShape::N / MmaShape::N, 1)];
-  using WGMMA_CRegistersArrayType = CRegistersType[WarpShape::N * 4 / MmaShape::M][WarpShape::M / MmaShape::N];
+  using WGMMA_CRegistersArrayType = CRegistersType[WarpShape::N * 4 / MmaShape::N][WarpShape::M / MmaShape::M];
   using CRegistersArrayType = std::conditional_t<kUseWgmma, WGMMA_CRegistersArrayType, MMA_CRegistersArrayType>;
 
   static constexpr uint32_t kNumWriteSplits = TuningConfig::kNumWriteSplits;
@@ -194,7 +194,7 @@ public:
       PRAGMA_UNROLL
       for (uint32_t j = 0; j < sizeof(regs[0]) / sizeof(regs[0][0]); j++) {
         auto part_regs = reinterpret_cast<PackTypeC *>(&regs[i][j]);
-        constexpr uint32_t inner_m = (kUseWgmma ? (MmaShape::M / 4) : MmaShape::M) / 8;
+        constexpr uint32_t inner_m = (kUseWgmma ? (MmaShape::N / 4) : MmaShape::M) / 8;
         constexpr uint32_t inner_n = sizeof(regs[0][0]) / sizeof(PackTypeC) / inner_m;
 
         PRAGMA_UNROLL

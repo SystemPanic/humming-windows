@@ -151,7 +151,9 @@ class WgmmaOpClassImpl:
         self.b_dtype = b_dtype if isinstance(b_dtype, str) else DTYPE_MAP[b_dtype]
         self.cd_dtype = cd_dtype if isinstance(cd_dtype, str) else DTYPE_MAP[cd_dtype]
 
-        self.reg_a_count = calc_reg_count(m, k, self.a_dtype) // 4
+        # Project B (registers) is sized (project N) x (project K) in b_dtype after
+        # the transpose — that's what fills the wgmma A register operand.
+        self.reg_b_count = calc_reg_count(n, k, self.b_dtype) // 4
         self.reg_cd_count = calc_reg_count(m, n, self.cd_dtype) // 4
         if self.cd_dtype == "f16":
             self.val_type_cd = "half"
@@ -182,12 +184,12 @@ class WgmmaOpClassImpl:
             f"static constexpr uint32_t kCTypeBits = {DTYPE_BIT_WIDTH_MAP[self.cd_dtype]};",
             f"static constexpr uint32_t kDTypeBits = {DTYPE_BIT_WIDTH_MAP[self.cd_dtype]};",
             "",
-            f"using ARegisters = uint32_t[{self.reg_a_count}];",
+            f"using BRegisters = uint32_t[{self.reg_b_count}];",
             f"using CRegisters = {self.reg_cd_type}[{self.reg_cd_count}];",
             f"using DRegisters = {self.reg_cd_type}[{self.reg_cd_count}];",
             "",
             "CUDA_INLINE",
-            f"static void fma(uint32_t *a, uint64_t &desc, {reg_cd_type} *d, bool pred = true) {{",
+            f"static void fma(uint64_t &desc, uint32_t *b, {reg_cd_type} *d, bool pred = true) {{",
             *self.generate_ptx(indent=2, has_scale_d=True).strip("\n").split("\n"),
             "};",
         ]
@@ -202,17 +204,21 @@ class WgmmaOpClassImpl:
         a_dtype = self.a_dtype
         b_dtype = self.b_dtype
         cd_dtype = self.cd_dtype
-        shape = self.shape
+        m, n, k = self.shape
 
-        asm_op = f"wgmma.mma_async.sync.aligned.m{shape[0]}n{shape[1]}k{shape[2]}"
-        asm_op += f".{cd_dtype}.{a_dtype}.{b_dtype}"
-        if "s" in a_dtype:
+        # Swap M<->N and A-dtype<->B-dtype in PTX: project's A becomes wgmma's B and
+        # project's B becomes wgmma's A. The PTX dtype suffix order is .cd.a.b, so
+        # the wgmma A slot takes project's b_dtype and the wgmma B slot takes a_dtype.
+        asm_op = f"wgmma.mma_async.sync.aligned.m{n}n{m}k{k}"
+        asm_op += f".{cd_dtype}.{b_dtype}.{a_dtype}"
+        # satfinite gates on the wgmma-A operand dtype (= project's B).
+        if "s" in b_dtype:
             asm_op += ".satfinite"
 
         start = 0
         end = 0
         param_placeholders_list = []
-        counts = [self.reg_cd_count, self.reg_a_count]
+        counts = [self.reg_cd_count, self.reg_b_count]
         for i in range(len(counts)):
             end += counts[i]
             placeholder_str = ", ".join(f"%{x}" for x in range(start, end))
@@ -221,16 +227,20 @@ class WgmmaOpClassImpl:
         param_placeholders_list.append(f"%{sum(counts)}")
 
         other_ptx_args = ", p" if has_scale_d else ", 1"
-        if self.a_dtype in ["f16", "bf16"]:
+        # The dtype-specific PTX tail args (scale/trans flags) gate on the wgmma-A
+        # operand dtype, which after the swap is project's b_dtype.
+        if self.b_dtype in ["f16", "bf16"]:
             other_ptx_args += ", 1, 1, 0"
-        elif self.a_dtype in ["e4m3", "e5m2", "e2m1"]:
+        elif self.b_dtype in ["e4m3", "e5m2", "e2m1"]:
             other_ptx_args += ", 1, 1"
 
-        b_param = ' "l"(desc)'
-        a_params = []
+        # Project A's smem descriptor fills the wgmma B operand.
+        a_desc_param = ' "l"(desc)'
+        # Project B's registers fill the wgmma A operand.
+        b_params = []
         cd_params = []
-        for i in range(self.reg_a_count):
-            a_params.append(f' "r"(a[{i}])')
+        for i in range(self.reg_b_count):
+            b_params.append(f' "r"(b[{i}])')
         for i in range(self.reg_cd_count):
             t = "f" if cd_dtype == "f32" else "r"
             cd_params.append(f'"+{t}"(d[{i}])')
@@ -256,8 +266,8 @@ class WgmmaOpClassImpl:
                 "{", ".join(param_placeholders_list)}{other_ptx_args};\\n"
               "}}\\n"
               : {cd_param_str}
-              : {", ".join(a_params)},
-                {b_param}, "r"((uint32_t)pred)
+              : {", ".join(b_params)},
+                {a_desc_param}, "r"((uint32_t)pred)
             );
             """
         else:
@@ -266,8 +276,8 @@ class WgmmaOpClassImpl:
             "{asm_op} "
             "{", ".join(param_placeholders_list)}{other_ptx_args};\\n"
             : {cd_param_str}
-            : {", ".join(a_params)},
-                {b_param}
+            : {", ".join(b_params)},
+                {a_desc_param}
             );
             """
 

@@ -183,8 +183,8 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
         else:
             mma_cd_dtype = dtypes.float32
 
-        mma_shape_m = 64 if self.mma_type == MmaType.WGMMA else 16
-        mma_shape_n = self.warp_shape[0] if self.mma_type == MmaType.WGMMA else 8
+        mma_shape_m = self.warp_shape[0] if self.mma_type == MmaType.WGMMA else 16
+        mma_shape_n = 64 if self.mma_type == MmaType.WGMMA else 8
         mma_shape_k = 256 // self.a_dtype.num_bits
         if self.sm_version == 75 and self.a_dtype == dtypes.int8:
             mma_shape_m = 8
@@ -196,8 +196,8 @@ class HummingKernel(KernelRuntime, LayerConfig, ComputeConfig, TuningConfig):
             mma_shape_k = mma_shape_k // 2
 
         if self.mma_type == MmaType.WGMMA:
-            assert self.warp_shape[0] % mma_shape_n == 0
-            assert self.warp_shape[1] % (mma_shape_m // 4) == 0
+            assert self.warp_shape[0] % mma_shape_m == 0
+            assert self.warp_shape[1] % (mma_shape_n // 4) == 0
         else:
             assert self.warp_shape[0] % mma_shape_m == 0
             assert self.warp_shape[1] % mma_shape_n == 0

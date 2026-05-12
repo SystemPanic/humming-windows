@@ -430,11 +430,11 @@ public:
     bool should_apply_bs = (kIsGroupWeightScale || kIsBlockWeightScale) && (is_last_iter || is_bs_group_end);
     if (!should_apply_as && !should_apply_bs) return;
 
-    using CRegistersArrayType = typename MmaOpClass::CRegisters[2][WarpShape::N * 4 / MmaShape::M][WarpShape::M / MmaShape::N];
+    using CRegistersArrayType = typename MmaOpClass::CRegisters[2][WarpShape::N * 4 / MmaShape::N][WarpShape::M / MmaShape::M];
     auto &regs_c = *reinterpret_cast<CRegistersArrayType *>(regs_c_ptr);
 
     PRAGMA_UNROLL
-    for (uint32_t index = 0; index < MmaShape::N * 16 / 64; index++) {
+    for (uint32_t index = 0; index < MmaShape::M * 16 / 64; index++) {
       uint32_t inner_n = index / 2;
       uint32_t inner_m = index % 2;
 
