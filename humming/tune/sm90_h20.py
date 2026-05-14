@@ -57,7 +57,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
         elif group_size >= 128:
             return {
                 "block_shape": (64, 128, 1024 // a_dtype.num_bits),
-                "warp_shape": (64, 32, 1024 // a_dtype.num_bits),
+                "warp_shape": (64, 16, 1024 // a_dtype.num_bits),
                 "num_ctas_per_sm": 2,
             }
         else:
