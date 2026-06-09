@@ -6,6 +6,7 @@ import torch
 from humming import dtypes
 from humming.kernel.humming import HummingKernel
 from humming.ops.bench import tops_bench  # noqa
+from humming.ops.hadamard import hadamard_quant_input, hadamard_transform
 from humming.ops.input import quant_input
 from humming.ops.moe import moe_fused_mul_sum
 from humming.ops.utils import init_humming_launcher, register_op
@@ -141,6 +142,8 @@ def _humming_gemm_fake(
     return inputs.new_empty((shape_m, shape_n), dtype=output_dtype)
 
 
+register_op("humming::hadamard_transform", hadamard_transform, hadamard_transform)
+register_op("humming::hadamard_quant_input", hadamard_quant_input, hadamard_quant_input)
 register_op("humming::quant_input", quant_input, quant_input)
 register_op("humming::quant_weight", quant_weight, quant_weight)
 register_op("humming::dequant_weight", dequant_weight, dequant_weight)
@@ -157,6 +160,8 @@ register_op(
 
 
 if not TYPE_CHECKING:
+    hadamard_transform = torch.ops.humming.hadamard_transform
+    hadamard_quant_input = torch.ops.humming.hadamard_quant_input
     quant_input = torch.ops.humming.quant_input
     quant_weight = torch.ops.humming.quant_weight
     dequant_weight = torch.ops.humming.dequant_weight
@@ -169,6 +174,8 @@ if not TYPE_CHECKING:
 
 
 __all__ = [
+    "hadamard_transform",
+    "hadamard_quant_input",
     "quant_input",
     "quant_weight",
     "dequant_weight",
