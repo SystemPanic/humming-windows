@@ -61,7 +61,11 @@ public:
   CUDA_INLINE void load_legacy(void *smem_ptr) {
     if constexpr (!kIsIndexedGemm && kIsChannelScale) {
       uint32_t *smem_ptr_load = reinterpret_cast<uint32_t *>(smem_ptr);
-      legacy_load_pred<kUseCpAsync>(gmem_ptr + thread_id, smem_ptr_load + thread_id, thread_id < BlockShape::M);
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < CEIL_DIV(BlockShape::M, kNumLoadThreads); i++) {
+        uint32_t idx = i * kNumLoadThreads + thread_id;
+        legacy_load_pred<kUseCpAsync>(gmem_ptr + idx, smem_ptr_load + idx, idx < block_shape_m);
+      }
     } else {
       constexpr uint32_t kSmemStride = kNumGroups / (sizeof(LoadType) / 4);
       constexpr uint32_t kGmemStride = kProblemNumGroups / (sizeof(LoadType) / 4);
@@ -119,7 +123,7 @@ public:
       gmem_ptr = gmem_ptr_raw + col_offset;
 
       constexpr uint32_t kSmemStride = kNumGroups / (sizeof(LoadType) / 4);
-      uint32_t smem_row = threadIdx.x / kSmemStride;
+      uint32_t smem_row = thread_id / kSmemStride;
 
       if (smem_row < BlockShape::M) {
         load_row_index = smem.rd_row_index[smem_row];
