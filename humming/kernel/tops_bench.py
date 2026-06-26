@@ -9,6 +9,7 @@ import torch
 from humming import dtypes
 from humming.config import MmaOpClass, MmaType
 from humming.jit.runtime import KernelRuntime
+from humming.utils.device import get_device_num_sms
 
 CODE_TEMPLATE = jinja2.Template("""
 #include <humming/kernel/tops_bench.cuh>
@@ -65,7 +66,7 @@ class TopsBenchKernel(KernelRuntime):
         if self.mma_type == MmaType.WGMMA:
             self.ops_per_mma_per_warp = self.ops_per_mma_per_warp // 4
             self.num_warps = self.num_warps // 4
-        self.sm_count = torch.cuda.get_device_properties().multi_processor_count
+        self.sm_count = get_device_num_sms()
         self.num_ctas = self.sm_count * 2
         self.ops_per_call = self.ops_per_mma_per_warp * self.num_warps * self.num_ctas
 
