@@ -83,4 +83,4 @@ class TopsBenchKernel(KernelRuntime):
         tensor = torch.empty((1,), dtype=torch.uint32, device="cuda:0")
         arg_values = (tensor.data_ptr(),)
 
-        cbd.cuLaunchKernelEx(config, self.kernel, (arg_values, self.arg_types), 0)
+        cbd.cuLaunchKernelEx(config, self.func, (arg_values, self.arg_types), 0)
