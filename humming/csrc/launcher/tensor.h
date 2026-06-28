@@ -105,7 +105,7 @@ inline void check_tensor_as(std::optional<Tensor> &tensor, KernelData &kernel_da
   uint32_t num_groups = group_size == 0 ? 1 : CEIL_DIV(problem_shape_k, group_size);
 
   std::vector<int64_t> expected_shape;
-  if (kernel_data.use_m_major_input_scale) {
+  if (kernel_data.use_m_major_input_scale && group_size > 0) {
     int64_t m_pad = (shape_m + 3) / 4 * 4;
     expected_shape = {(int64_t)num_groups, m_pad};
   } else {
