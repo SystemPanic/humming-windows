@@ -188,7 +188,7 @@ public:
     if (pred) {
       uint64_t *mbar_ptr = nullptr;
       if constexpr (kUseMBarrier) mbar_ptr = &smem.load_mbar[mbar_index];
-      loader_a.template load<kShouldAdvance>(smem.stages[stage_id].a, mbar_ptr);
+      loader_a.template load<kShouldAdvance>(smem.stages[stage_id].a, mbar_ptr, stage_id);
       loader_b.template load<kShouldAdvance>(smem.stages[stage_id].b, mbar_ptr);
       if constexpr (kIsGroupInputScale) {
         loader_as.template load<kShouldAdvance>(smem.stages[stage_id].as, mbar_ptr);
