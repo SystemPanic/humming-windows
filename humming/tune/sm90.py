@@ -60,6 +60,11 @@ class Sm90Heuristics(DeviceHeuristics):
             elif block_shape_m <= 32:
                 warp_shape_k = warp_shape_k // 2
 
+        while meta.shape_k % block_shape_k != 0:
+            warp_shape_k = 512 // meta.a_dtype.num_bits
+            block_shape_k = block_shape_k // 2
+            assert block_shape_k >= warp_shape_k
+
         config = {
             "block_shape": (block_shape_m, block_shape_n, block_shape_k),
             "warp_shape": (block_shape_m, warp_shape_n, warp_shape_k),
@@ -101,6 +106,8 @@ class Sm90Heuristics(DeviceHeuristics):
         block_shape_m = np.argmin(num_blocks_list).item() * 8 + 8
 
         block_shape_k = 256 if block_shape_m <= 32 else 128
+        if meta.shape_k % 256 != 0:
+            block_shape_k = 128
 
         config = {
             "block_shape": (block_shape_m, 128, block_shape_k),

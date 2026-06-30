@@ -61,6 +61,7 @@ CUDA_INLINE void barrier_release2(int *lock, int32_t val) {
   sync_part_threads<kNumSyncThreads, kNumThreads>();
   if (threadIdx.x == 0) {
     if (val < 0) {
+      asm volatile("fence.acq_rel.gpu;\n");
       __stcg(&lock[0], val);
     } else {
       int32_t val2 = 1;
@@ -102,6 +103,18 @@ void mbarrier_wait(void *barrier, bool phase_parity) {
                : "memory");
 #endif
 };
+
+
+template <bool kUseCluster>
+CUDA_INLINE void mbarrier_init_sync() {
+  if constexpr (kUseCluster) {
+    asm volatile("fence.mbarrier_init.release.cluster;");
+    asm volatile("barrier.cluster.arrive;");
+    asm volatile("barrier.cluster.wait;");
+  } else {
+    __syncthreads();
+  }
+}
 
 
 template <bool kUseCluster = false>

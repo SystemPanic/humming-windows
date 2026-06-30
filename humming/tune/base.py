@@ -2,10 +2,10 @@ import math
 from typing import TYPE_CHECKING
 
 import numpy as np
-import torch
 
 from humming import dtypes
 from humming.config import GemmType
+from humming.utils.device import get_device_num_sms
 from humming.utils.smem import estimate_smem_size_layer
 
 if TYPE_CHECKING:
@@ -179,6 +179,11 @@ class DeviceHeuristics:
                 warp_shape_m = math.ceil(warp_shape_m / 16) * 16
                 block_shape_m = num_warps_m * warp_shape_m
 
+        while meta.shape_k % block_shape_k != 0:
+            block_shape_k = block_shape_k // 2
+            warp_shape_k = 512 // meta.a_dtype.num_bits
+            assert block_shape_k >= warp_shape_k
+
         if num_ctas_per_sm == 1:
             factor = min(4.5, meta.shape_k / (3 * block_shape_k))
             num_sms = min(num_sms, math.ceil(num_blocks_n * num_blocks_m * factor))
@@ -207,7 +212,7 @@ class DeviceHeuristics:
 
     @classmethod
     def get_num_sms(cls):
-        return torch.cuda.get_device_properties().multi_processor_count
+        return get_device_num_sms()
 
     @classmethod
     def get_configs(
