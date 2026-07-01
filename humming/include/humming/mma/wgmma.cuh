@@ -103,9 +103,11 @@ public:
     static_assert(WarpShape::M == MmaShape::M);
     uint32_t buffer_id = iter_id % 2;
 
+    const uint32_t smem_base = cast_smem_ptr_to_uint(&smem);
+
     PRAGMA_UNROLL
     for (uint32_t k = 0; k < kPartMmaShapeK / MmaShape::K; k++) {
-      uint32_t smem_addr = offsetof(SharedStorage, stages) + stage_id * sizeof(typename SharedStorage::StageStorage);
+      uint32_t smem_addr = smem_base + offsetof(SharedStorage, stages) + stage_id * sizeof(typename SharedStorage::StageStorage);
       smem_addr += (iter_id * 2 + k) * sizeof(int4) + smem_offset;
       uint64_t desc = make_wgmma_smem_desc<kSwizzleBytes>(smem_addr);
 

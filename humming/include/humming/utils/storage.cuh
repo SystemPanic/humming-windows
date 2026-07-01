@@ -156,7 +156,7 @@ public:
     IF_HAS_STAGE_ZERO_POINT(alignas(128) int4 bzp[kStageSizeBZP];)
   };
 
-  union alignas(128) {
+  union alignas(1024) {
     struct {
       IF_HAS_CHANNEL_ZERO_POINT(alignas(128) int4 bzp_c[kChannelSizeBZP];)
       StageStorage stages[kNumStages];
