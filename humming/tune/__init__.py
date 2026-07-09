@@ -53,7 +53,7 @@ def get_heuristics_class(
 def _apply_m_major_input_scale(
     config: dict,
     use_m_major_input_scale: bool,
-    meta: HummingLayerMeta,
+    meta: "HummingLayerMeta",
     gemm_type: GemmType,
 ) -> None:
     if not use_m_major_input_scale:

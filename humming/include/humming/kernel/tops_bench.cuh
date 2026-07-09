@@ -20,7 +20,7 @@ __global__ void tops_bench(uint32_t *out_ptr) {
 
   typename MmaOpClass::CRegisters regs_c;
 
-  if constexpr (Ctx::kUseWgmma) {
+  if constexpr (MmaOpClass::kMmaType == MmaType::WGMMA) {
     typename MmaOpClass::BRegisters regs_b;
     __shared__ alignas(1024) int4 smem[2048];
     uint64_t desc = make_wgmma_smem_desc<128>(cast_smem_ptr_to_uint(smem));
