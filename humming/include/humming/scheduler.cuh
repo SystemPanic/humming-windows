@@ -31,6 +31,8 @@ private:
   static constexpr uint32_t N_BLOCKS = ProblemShape::N / BlockShape::N / kMultiCastSizeA;
   static constexpr uint32_t K_BLOCKS = ProblemShape::K / BlockShape::K;
 
+  static constexpr uint32_t kRasterGroupM = Ctx::kRasterGroupM;
+
   uint32_t m_blocks;
   uint32_t mn_blocks;
   uint32_t mnk_blocks;
@@ -181,13 +183,28 @@ public:
   }
 
   CUDA_INLINE
+  void map_mn_block(uint32_t mn_index, uint32_t &m_id, uint32_t &n_id) {
+    if constexpr (kRasterGroupM <= 1 || !kIsDenseGemm) {
+      m_id = mn_index / N_BLOCKS;
+      n_id = mn_index % N_BLOCKS;
+    } else {
+      const uint32_t blocks_per_group = kRasterGroupM * N_BLOCKS;
+      const uint32_t group_id = mn_index / blocks_per_group;
+      const uint32_t first_m = group_id * kRasterGroupM;
+      const uint32_t group_m = MIN(m_blocks - first_m, kRasterGroupM);
+      const uint32_t idx_in_group = mn_index - group_id * blocks_per_group;
+      m_id = first_m + idx_in_group % group_m;
+      n_id = idx_in_group / group_m;
+    }
+  }
+
+  CUDA_INLINE
   bool get_next_block() {
     bool has_next_block = false;
     if (dp_mn_iters) {
       slice_iters = K_BLOCKS;
 
-      m_block_id = dp_mn_next_index / N_BLOCKS;
-      n_block_id = dp_mn_next_index % N_BLOCKS;
+      map_mn_block(dp_mn_next_index, m_block_id, n_block_id);
 
       if constexpr (kMultiCastSizeB > 1) {
         m_block_id = m_block_id * kMultiCastSizeB + cluster_rank;
@@ -217,8 +234,7 @@ public:
     if (!streamk_mnk_iters) return false;
     uint32_t streamk_mn_index = streamk_mnk_next_index / K_BLOCKS;
 
-    m_block_id = streamk_mn_index / N_BLOCKS;
-    n_block_id = streamk_mn_index % N_BLOCKS;
+    map_mn_block(streamk_mn_index, m_block_id, n_block_id);
     if constexpr (kMultiCastSizeB > 1) {
       m_block_id = m_block_id * kMultiCastSizeB + cluster_rank;
     } else if constexpr (kMultiCastSizeA > 1) {
