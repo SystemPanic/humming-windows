@@ -23,6 +23,7 @@ private:
   static constexpr uint32_t kSmemStride = BlockShape::K * ElementA::kBits / 32 / 4;
   static constexpr uint32_t kGmemStride = (ProblemShape::K - PadShape::K) * ElementA::kBits / 32 / 4;
   static constexpr uint32_t kNumInt4s = kSmemStride * BlockShape::M;
+  static constexpr uint32_t kColOffsetToElem = MAX(ElementA::kBits, 8) / ElementA::kBits;
 
   static_assert(BlockShape::K * ElementA::kBits >= 512);
   static constexpr uint32_t kSwizzleBytes = BlockShape::K * ElementA::kBits == 512 ? 64 : 128;
@@ -54,9 +55,22 @@ public:
 
   template <bool kShouldAdvance = true>
   CUDA_INLINE void load(int4 *smem_ptr, void *mbar_ptr, uint32_t stage_id = 0) {
-    if constexpr (kUseTma) load_tma(smem_ptr, mbar_ptr);
+    if constexpr (USE_PPU && !kIsIndexedGemm && kUseCpAsync && !kUseTma) load_aiu(smem_ptr);
+    else if constexpr (kUseTma) load_tma(smem_ptr, mbar_ptr);
     else load_legacy(smem_ptr, stage_id);
     if constexpr (kShouldAdvance) advance();
+  }
+
+  CUDA_INLINE
+  void load_aiu(int4 *smem_ptr) {
+    const uint32_t warp_id = ctx.load_thread_id() / 32;
+    if (warp_id < CEIL_DIV(BlockShape::K, 1024 / ElementA::kBits)) {
+      aiu_load_gmem<ElementA::kBits>(
+          gmem_ptr_raw, smem_ptr + BlockShape::M * 1024 / 128 * warp_id,
+          shape_m, ProblemShape::K - PadShape::K,
+          row_offset, col_offset + warp_id * 1024 / ElementA::kBits,
+          BlockShape::M, MIN(1024 / ElementA::kBits, BlockShape::K));
+    }
   }
 
   CUDA_INLINE
@@ -65,11 +79,23 @@ public:
     if (thread_id < kNumTmaLoadsPerLine) {
       const uint32_t block_idx = thread_id;
       const uint32_t smem_offset = BlockShape::M * 8 * block_idx;
-      const uint32_t col_offset2 = col_offset + (1024 / ElementA::kBits) * block_idx;
+      const uint32_t col_offset2 = col_offset + (1024 / MAX(ElementA::kBits, 8)) * block_idx;
       if constexpr (kMultiCastSizeA == 1) {
         tma_load_2d(tensor_map_ptr, smem_ptr + smem_offset, mbar_ptr, col_offset2, row_offset);
-      } else if (ctx.cluster_rank == 0) {
+      } else if (blockIdx.x % kMultiCastSizeA == 0) {
         tma_load_2d<kMultiCastSizeA>(tensor_map_ptr, smem_ptr + smem_offset, mbar_ptr, col_offset2, row_offset);
+      }
+    }
+  }
+
+  CUDA_INLINE
+  void prefetch_tma() {
+    if constexpr (kUseTma) {
+      uint32_t thread_id = ctx.load_thread_id();
+      if (thread_id < kNumTmaLoadsPerLine && (kMultiCastSizeA == 1 || blockIdx.x % kMultiCastSizeA == 0)) {
+        const uint32_t block_idx = thread_id;
+        const uint32_t col_offset2 = col_offset + (1024 / MAX(ElementA::kBits, 8)) * block_idx;
+        tma_prefetch_2d(tensor_map_ptr, col_offset2, row_offset);
       }
     }
   }
@@ -89,20 +115,20 @@ public:
     uint32_t thread_id = ctx.load_thread_id();
     uint32_t smem_uint = offsetof(SharedStorage, stages) + stage_id * sizeof(typename SharedStorage::StageStorage);
     uint32_t smem_base = smem_uint / 128 % 8;
-    uint32_t smem_swizzled_col = (thread_id % 8) ^ (((thread_id % 64) / 8 + smem_base)) % 8;
 
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < kLoadIters; i++) {
       uint32_t smem_offset = i * kNumLoadThreads + thread_id;
       uint32_t smem_row = smem_offset / 8;
       uint32_t smem_col = smem_offset % 8;
+      uint32_t smem_swizzled_col = smem_col ^ ((smem_row + smem_base) % 8);
       uint32_t smem_swizzled_offset = smem_row * 8 + smem_swizzled_col;
 
       uint32_t gmem_col = smem_row / BlockShape::M * 8 + smem_col;
       uint32_t gmem_row = kIsIndexedGemm ? load_row_index[i] : (smem_row % BlockShape::M);
       uint32_t gmem_offset = gmem_row * kGmemStride + gmem_col;
 
-      bool pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset) < (ProblemShape::K - PadShape::K);
+      bool pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset * kColOffsetToElem) < (ProblemShape::K - PadShape::K);
       bool pred1 = kNumInt4s % kNumLoadThreads == 0 || i != kLoadIters - 1 || smem_offset < kNumInt4s;
       bool pred2 = gmem_row < (kIsIndexedGemm ? shape_m : block_shape_m);
 
@@ -120,13 +146,13 @@ public:
     uint32_t thread_id = ctx.load_thread_id();
     uint32_t smem_uint = offsetof(SharedStorage, stages) + stage_id * sizeof(typename SharedStorage::StageStorage);
     uint32_t smem_base = smem_uint / 128 % 4;
-    uint32_t smem_swizzled_col = (thread_id % 8) ^ (((thread_id % 32) / 8 + smem_base) % 4);
 
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < kLoadIters; i++) {
       uint32_t smem_offset = i * kNumLoadThreads + thread_id;
       uint32_t smem_row = smem_offset / 8;
       uint32_t smem_col = smem_offset % 8;
+      uint32_t smem_swizzled_col = smem_col ^ ((smem_row + smem_base) % 4);
       uint32_t smem_swizzled_offset = smem_row * 8 + smem_swizzled_col;
 
       uint32_t gmem_row = smem_row % (BlockShape::M / 2) * 2 + smem_col / 4;
@@ -134,7 +160,7 @@ public:
       uint32_t gmem_col = smem_col % 4;
       uint32_t gmem_offset = gmem_row * kGmemStride + gmem_col;
 
-      bool pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset) < (ProblemShape::K - PadShape::K);
+      bool pred0 = (gmem_col * (128 / ElementA::kBits) + col_offset * kColOffsetToElem) < (ProblemShape::K - PadShape::K);
       bool pred1 = kNumInt4s % kNumLoadThreads == 0 || i != kLoadIters - 1 || smem_offset < kNumInt4s;
       bool pred2 = gmem_row < (kIsIndexedGemm ? shape_m : block_shape_m);
       if constexpr (PadShape::K == 0) {
@@ -147,7 +173,7 @@ public:
 
   CUDA_INLINE
   void advance() {
-    col_offset += BlockShape::K;
+    col_offset += BlockShape::K * ElementA::kBits / MAX(ElementA::kBits, 8);
     gmem_ptr += kSmemStride;
   }
 
@@ -159,11 +185,11 @@ public:
     } else {
       row_offset = m_block_id * BlockShape::M;
     }
-    col_offset = k_block_id * BlockShape::K;
-    block_shape_m = MIN(shape_m - row_offset, BlockShape::M);
+    col_offset = k_block_id * (BlockShape::K * ElementA::kBits / MAX(ElementA::kBits, 8));
+    block_shape_m = row_offset < shape_m ? MIN(shape_m - row_offset, BlockShape::M) : 0;
 
     uint32_t gmem_offset = k_block_id * kSmemStride;
-    gmem_offset += kIsIndexedGemm ? 0 : (row_offset * kGmemStride);
+    gmem_offset += kIsIndexedGemm ? 0 : (MIN(row_offset, shape_m) * kGmemStride);
     gmem_ptr = gmem_ptr_raw + gmem_offset;
 
     if constexpr (kIsIndexedGemm) {

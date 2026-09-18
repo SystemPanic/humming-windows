@@ -10,6 +10,8 @@ class DataType:
     is_signed: bool = True
     is_integer_type: bool = False
     is_floating_point_type: bool = False
+    exponent_bits: int = 0
+    mantissa_bits: int = 0
 
     def __post_init__(self):
         assert self.__class__ is not DataType
@@ -34,6 +36,17 @@ class DataType:
             return IntegerType.from_torch_dtype(torch_dtype)
         else:
             raise NotImplementedError
+
+    @classmethod
+    def from_any(cls, dtype):
+        if isinstance(dtype, DataType):
+            return dtype
+        elif isinstance(dtype, str):
+            return cls.from_str(dtype)
+        elif isinstance(dtype, torch.dtype):
+            return cls.from_torch_dtype(dtype)
+        else:
+            raise ValueError(f"unsupported dtype: {dtype}")
 
     def to_str(self):
         raise NotImplementedError
@@ -91,8 +104,8 @@ class IntegerType(DataType):
 
     def id(self):
         dtype_id = 1 * 1e7  # int type
-        dtype_id += self.num_bits * 1e5  # num_bits
-        dtype_id += self.is_signed * 1e4  # is_sign
+        dtype_id += self.is_signed * 1e6  # is_sign
+        dtype_id += self.num_bits * 1e4  # num_bits
         return int(dtype_id)
 
 
@@ -159,11 +172,11 @@ class FloatingPointType(DataType):
         return cls.from_str(dtype_str)
 
     def id(self):
-        dtype_id = 2 * 1e7  # int type
-        dtype_id += self.num_bits * 1e5  # num_bits
-        dtype_id += self.is_signed * 1e4  # is_sign
+        dtype_id = 2 * 1e7  # floating-point type
+        dtype_id += self.is_signed * 1e6  # is_sign
+        dtype_id += self.num_bits * 1e4  # num_bits
         dtype_id += self.exponent_bits * 1e2  # exp_bits
-        dtype_id += self.mantissa_bits  # num_bits
+        dtype_id += self.mantissa_bits  # mantissa bits
         return int(dtype_id)
 
 
@@ -183,9 +196,11 @@ int6 = IntegerType.from_str("int6")
 int8 = IntegerType.from_str("int8")
 int32 = IntegerType.from_str("int32")
 
+float4e0m3 = FloatingPointType.from_str("float4e0m3")
 float4e2m1 = FloatingPointType.from_str("float4e2m1")
 float6e2m3 = FloatingPointType.from_str("float6e2m3")
 float6e3m2 = FloatingPointType.from_str("float6e3m2")
+float8e3m4 = FloatingPointType.from_str("float8e3m4")
 float8e4m3 = FloatingPointType.from_str("float8e4m3")
 float8e5m2 = FloatingPointType.from_str("float8e5m2")
 float8e8m0 = FloatingPointType.from_str("float8e8m0")
@@ -196,6 +211,7 @@ float32 = FloatingPointType.from_str("float32")
 
 
 torch_dtype_map = {
+    int8: torch.int8,
     float8e8m0: torch.float8_e8m0fnu,
     float8e4m3: torch.float8_e4m3fn,
     float8e5m2: torch.float8_e5m2,

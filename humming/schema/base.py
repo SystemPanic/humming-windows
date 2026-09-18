@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 
-from humming import dtypes
+from humming.utils.math import round_up
 
 if TYPE_CHECKING:
     from humming.schema.humming import HummingInputSchema, HummingWeightSchema
@@ -50,8 +50,8 @@ class BaseWeightSchema:
         pad_k_to_multiple: int = 1,
         stack_size: int = 1,
     ) -> dict[str, dict[str, Any]]:
-        padded_shape_n = math.ceil(shape_n / pad_n_to_multiple) * pad_n_to_multiple
-        padded_shape_k = math.ceil(shape_k / pad_k_to_multiple) * pad_k_to_multiple
+        padded_shape_n = round_up(shape_n, pad_n_to_multiple)
+        padded_shape_k = round_up(shape_k, pad_k_to_multiple)
 
         tensors_attrs = self.get_tensors_attrs(
             shape_n=shape_n,
@@ -93,10 +93,31 @@ class BaseWeightSchema:
     ) -> dict[str, dict[str, Any]]:
         raise NotImplementedError
 
+    def to_humming_schema(self, param_dtype: torch.dtype) -> "HummingWeightSchema":
+        raise NotImplementedError
+
     def process_loaded_weight(self, tensor: torch.Tensor, name: str) -> torch.Tensor:
         return tensor
 
     def convert_humming(
+        self,
+        tensors: dict[str, torch.Tensor],
+        shape_n_stacks: list[int],
+        shape_k_stacks: list[int],
+        param_dtype: torch.dtype,
+        num_experts: int | None = None,
+        device: int | torch.device | None = None,
+    ) -> tuple["HummingWeightSchema", dict[str, torch.Tensor]]:
+        with torch.cuda.device(device):
+            return self._convert_humming(
+                tensors,
+                shape_n_stacks,
+                shape_k_stacks,
+                param_dtype,
+                num_experts,
+            )
+
+    def _convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
         shape_n_stacks: list[int],
@@ -211,48 +232,6 @@ class BaseInputSchema:
     def get_activation_bits(self):
         raise NotImplementedError
 
-    def get_fallback_input_dtype(
-        self,
-        a_dtype: dtypes.DataType | None,
-        sm_version: int | tuple[int, int] | None = None,
-    ) -> dtypes.DataType | None:
-        if sm_version is None:
-            sm_version = torch.cuda.get_device_capability()
-        if isinstance(sm_version, tuple):
-            sm_version = sm_version[0] * 10 + sm_version[1]
-        assert isinstance(sm_version, int)
-
-        a_dtype_order: list[dtypes.DataType] = []
-        if a_dtype is None or a_dtype in [dtypes.float16, dtypes.bfloat16]:
-            return a_dtype
-        elif a_dtype == dtypes.float8e4m3:
-            a_dtype_order = [dtypes.float8e4m3]
-        elif a_dtype == dtypes.float8e5m2:
-            a_dtype_order = [dtypes.float8e5m2]
-        elif a_dtype == dtypes.float4e2m1:
-            # NOTE: float4e2m1 isn't fully tested now, so disable it
-            a_dtype_order = [dtypes.float8e4m3]
-        elif a_dtype == dtypes.int8:
-            a_dtype_order = [dtypes.int8]
-        elif a_dtype == dtypes.int4:
-            a_dtype_order = [dtypes.int4, dtypes.float8e4m3, dtypes.int8]
-        else:
-            raise ValueError(f"unsupported a_dtype: {a_dtype}")
-
-        for dtype in a_dtype_order:
-            if dtype == dtypes.float8e4m3 and sm_version >= 89:
-                return dtype
-            elif dtype == dtypes.float8e5m2 and sm_version >= 89:
-                return dtype
-            elif dtype == dtypes.float4e2m1 and sm_version >= 120:
-                return dtype
-            elif dtype == dtypes.int8:
-                return dtype
-            elif dtype == dtypes.int4 and sm_version >= 80:
-                return dtype
-
-        return None
-
     def _get_input_scale_attrs(
         self,
         num_experts: int | None = None,
@@ -271,6 +250,19 @@ class BaseInputSchema:
         self.may_add_expert_dim(tensor_meta, num_experts)
         return tensor_meta
 
+    @staticmethod
+    def _convert_static_tensor_scale(
+        tensors: dict[str, torch.Tensor],
+        source_name: str,
+        target_name: str,
+        reciprocal: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        scale = tensors[source_name].float()
+        if reciprocal:
+            scale = scale.reciprocal()
+        scale = scale.amax().reshape(1)
+        return {target_name: scale.contiguous()}
+
     def get_tensors_attrs(
         self,
         shape_k: int,
@@ -280,7 +272,28 @@ class BaseInputSchema:
     ) -> dict[str, dict[str, Any]]:
         return {}
 
+    def to_humming_schema(self, param_dtype: torch.dtype) -> "HummingInputSchema":
+        raise NotImplementedError
+
     def convert_humming(
+        self,
+        tensors: dict[str, torch.Tensor],
+        shape_n_stacks: list[int],
+        shape_k_stacks: list[int],
+        param_dtype: torch.dtype,
+        num_experts: int | None = None,
+        device: int | torch.device | None = None,
+    ) -> tuple["HummingInputSchema", dict[str, torch.Tensor]]:
+        with torch.cuda.device(device):
+            return self._convert_humming(
+                tensors,
+                shape_n_stacks,
+                shape_k_stacks,
+                param_dtype,
+                num_experts,
+            )
+
+    def _convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
         shape_n_stacks: list[int],

@@ -77,7 +77,16 @@ class GPTQWeightSchema(BaseWeightSchema):
         has_bias = "bias" in tensors
         return shape_n, shape_k, None, has_bias
 
-    def convert_humming(
+    def to_humming_schema(self, param_dtype: torch.dtype) -> HummingWeightSchema:
+        assert not self.desc_act
+        return HummingWeightSchema(
+            b_dtype=dtypes.DataType.from_str(f"uint{self.bits}"),
+            bs_dtype=dtypes.DataType.from_torch_dtype(param_dtype),
+            weight_scale_group_size=self.group_size,
+            has_zero_point=not self.sym,
+        )
+
+    def _convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
         shape_n_stacks: list[int],
@@ -85,12 +94,7 @@ class GPTQWeightSchema(BaseWeightSchema):
         param_dtype: torch.dtype,
         num_experts: int | None = None,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
-        assert not self.desc_act
-        schema = HummingWeightSchema(
-            b_dtype=dtypes.DataType.from_str(f"uint{self.bits}"),
-            weight_scale_group_size=self.group_size,
-            has_zero_point=not self.sym,
-        )
+        schema = self.to_humming_schema(param_dtype)
 
         weight = tensors["qweight"]
         weight = weight.transpose(-1, -2).contiguous()

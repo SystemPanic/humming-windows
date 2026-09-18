@@ -3,6 +3,9 @@
 #include <cuda.h>
 
 
+#ifndef USE_PPU
+  #define USE_PPU 0
+#endif
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define CEIL_DIV(a, b) ((a + b - 1) / (b))
@@ -11,6 +14,47 @@
 #define PRAGMA_UNROLL _Pragma(STR(unroll))
 #define PRAGMA_UNROLL_COUNT(n) _Pragma(STR(unroll n))
 #define CUDA_INLINE __device__ __forceinline__
+
+template <uint32_t kValue>
+struct CompileTimeConstant {
+  static constexpr uint32_t value = kValue;
+};
+
+template <uint32_t kIndex = 0, uint32_t kEnd, class Func>
+CUDA_INLINE void static_for(Func &&func) {
+  if constexpr (kIndex < kEnd) {
+    func(CompileTimeConstant<kIndex>{});
+    static_for<kIndex + 1, kEnd>(static_cast<Func &&>(func));
+  }
+}
+
+#ifndef HUMMING_DEBUG_KERNEL
+#define HUMMING_DEBUG_KERNEL 0
+#endif
+
+#ifndef HUMMING_DEBUG_KERNEL_TIMEOUT_CLOCKS
+#define HUMMING_DEBUG_KERNEL_TIMEOUT_CLOCKS 30000000000ULL
+#endif
+
+constexpr uint64_t kDebugKernelTimeoutClocks = HUMMING_DEBUG_KERNEL_TIMEOUT_CLOCKS;
+
+CUDA_INLINE uint64_t debug_kernel_timer_start() {
+#if HUMMING_DEBUG_KERNEL
+  return clock64();
+#else
+  return 0;
+#endif
+}
+
+CUDA_INLINE void debug_kernel_timeout_check(
+    uint64_t start_clock,
+    const char *message = "Humming kernel execution timeout") {
+#if HUMMING_DEBUG_KERNEL
+  if ((threadIdx.x % 32) == 0 && clock64() - start_clock >= kDebugKernelTimeoutClocks) {
+    __assertfail(message, __FILE__, __LINE__, __func__, 1);
+  }
+#endif
+}
 
 
 template <typename T>
@@ -36,6 +80,15 @@ constexpr uint32_t get_max_load_bytes(uint32_t bytes) {
   if (bytes % 4 == 0) return 4;
   if (bytes % 2 == 0) return 2;
   return 1;
+}
+
+constexpr uint32_t constexpr_log2(uint32_t value) {
+  uint32_t result = 0;
+  while (value > 1) {
+    value >>= 1;
+    result++;
+  }
+  return result;
 }
 
 template <int bytes>

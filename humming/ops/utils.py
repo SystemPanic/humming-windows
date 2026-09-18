@@ -1,13 +1,18 @@
 import contextlib
+import functools
+import inspect
 import os
 import subprocess
 import sys
+import types
+import typing
 from pathlib import Path
 from typing import Callable
 
 import torch
 import torch.utils.cpp_extension
 from filelock import FileLock
+from torch._subclasses.fake_tensor import FakeTensor
 
 import humming.utils.jit as jit_utils
 from humming.utils.cuda import filter_cuda_paths
@@ -16,26 +21,130 @@ _libs = {}
 _launcher_inited = False
 
 
+def _is_optional_tensor(annotation) -> bool:
+    args = typing.get_args(annotation)
+    return len(args) == 2 and torch.Tensor in args and type(None) in args
+
+
+def _infer_op_schema(impl_func: Callable, mutates_args: list[str]) -> str:
+    """Infer an op schema, adding Optional[Tensor] output support missing in PyTorch."""
+    signature = inspect.signature(impl_func)
+    return_annotation = typing.get_type_hints(impl_func).get(
+        "return",
+        signature.return_annotation,
+    )
+    tuple_args = typing.get_args(return_annotation)
+    tuple_return = typing.get_origin(return_annotation) is tuple
+    optional_outputs = (
+        [_is_optional_tensor(arg) for arg in tuple_args]
+        if tuple_return
+        else [_is_optional_tensor(return_annotation)]
+    )
+    if not any(optional_outputs):
+        return torch.library.infer_schema(impl_func, mutates_args=mutates_args)
+
+    normalized_return = torch.Tensor
+    if tuple_return:
+        normalized_args = tuple(
+            torch.Tensor if optional else arg
+            for arg, optional in zip(tuple_args, optional_outputs, strict=True)
+        )
+        normalized_return = tuple[normalized_args]
+
+    def schema_prototype():
+        pass
+
+    prototype = types.FunctionType(
+        schema_prototype.__code__,
+        impl_func.__globals__,
+        impl_func.__name__,
+    )
+    prototype.__signature__ = signature.replace(return_annotation=normalized_return)
+    schema = torch.library.infer_schema(prototype, mutates_args=mutates_args)
+    arguments, returns = schema.rsplit(" -> ", 1)
+
+    if not tuple_return:
+        assert returns == "Tensor"
+        return f"{arguments} -> Tensor?"
+
+    if len(optional_outputs) == 1:
+        assert returns.startswith("((") and returns.endswith("))")
+        return_types = [returns[2:-2]]
+    else:
+        assert returns.startswith("(") and returns.endswith(")")
+        return_types = returns[1:-1].split(", ")
+    for index, optional in enumerate(optional_outputs):
+        if optional:
+            assert return_types[index] == "Tensor"
+            return_types[index] = "Tensor?"
+    if len(return_types) == 1:
+        return f"{arguments} -> (({return_types[0]}))"
+    return f"{arguments} -> ({', '.join(return_types)})"
+
+
+def _prepare_output(
+    outputs: torch.Tensor,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if outputs.nelement() > 0:
+        assert outputs.shape == shape
+        assert outputs.dtype == dtype
+        assert outputs.device == device
+        assert outputs.is_contiguous()
+        returned_outputs = outputs.new_empty((0,))
+    else:
+        outputs = torch.empty(shape, dtype=dtype, device=device)
+        returned_outputs = outputs
+    return outputs, returned_outputs
+
+
+def _prepare_output_arg(
+    inputs: torch.Tensor,
+    outputs: torch.Tensor | None,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    assert outputs is None or outputs.nelement() > 0
+    return inputs.new_empty((0,), dtype=dtype) if outputs is None else outputs
+
+
+def _should_use_torch_op(inputs: torch.Tensor) -> bool:
+    return torch.compiler.is_compiling() or isinstance(inputs, FakeTensor)
+
+
+def _select_output(outputs: torch.Tensor, returned_outputs: torch.Tensor) -> torch.Tensor:
+    return outputs if outputs.nelement() > 0 else returned_outputs
+
+
 def register_op(
     name: str,
-    impl_func: Callable,
-    fake_impl_func: Callable | None = None,
     mutates_args: list[str] | None = None,
 ):
-    mutates_args = [] if mutates_args is None else mutates_args
-    schema_str = torch.library.infer_schema(impl_func, mutates_args=mutates_args)
-    lib_name, op_name = name.split("::")
+    def decorator(impl_func: Callable):
+        schema_str = _infer_op_schema(impl_func, mutates_args or [])
+        lib_name, op_name = name.split("::")
+        first_arg_name = next(iter(inspect.signature(impl_func).parameters))
 
-    if lib_name not in _libs:
-        _lib = torch.library.Library(lib_name, "FRAGMENT")
-        _libs[lib_name] = _lib
+        @functools.wraps(impl_func)
+        def device_guarded_impl(*args, **kwargs):
+            device_guard = args[0] if args else kwargs[first_arg_name]
+            if isinstance(device_guard, FakeTensor) or not device_guard.is_cuda:
+                return impl_func(*args, **kwargs)
+            with torch.cuda.device(device_guard.device):
+                return impl_func(*args, **kwargs)
 
-    _lib = _libs[lib_name]
-    _lib.define(op_name + schema_str)
-    _lib.impl(op_name, impl_func, dispatch_key="CUDA")
-    if fake_impl_func is not None:
+        if lib_name not in _libs:
+            _libs[lib_name] = torch.library.Library(lib_name, "FRAGMENT")
+
+        lib = _libs[lib_name]
+        lib.define(op_name + schema_str)
+        lib.impl(op_name, device_guarded_impl, dispatch_key="CUDA")
         with _shield_lazy_modules():
-            _lib._register_fake(op_name, fake_impl_func)
+            lib._register_fake(op_name, impl_func)
+        return device_guarded_impl
+
+    return decorator
 
 
 @contextlib.contextmanager
@@ -60,11 +169,9 @@ def get_humming_launcher_build_dir(use_torch_stable_api: bool):
     )
 
     cache_dir = jit_utils.get_humming_cache_dir()
-    py_version = f"py{sys.version_info.major}{sys.version_info.minor}"
     torch_major, torch_minor = torch.__version__.split(".")[:2]
-    torch_version = f"torch{torch_major}{torch_minor}"
-    abi_tag = "stable" if use_torch_stable_api else "nostable"
-    version = f"{py_version}_{torch_version}_{abi_tag}"
+    version = "torch211_stable" if use_torch_stable_api else f"torch{torch_major}{torch_minor}_nostable"
+    version += "_" + jit_utils.hash_to_hex(jit_utils.get_native_platform_signature())
 
     launcher_build_dir = os.path.join(cache_dir, f"launcher/{version}/{launcher_code_hash}")
     Path(launcher_build_dir).mkdir(exist_ok=True, parents=True)
@@ -72,26 +179,23 @@ def get_humming_launcher_build_dir(use_torch_stable_api: bool):
 
 
 def _resolve_use_torch_stable_api() -> bool:
-    """Decide whether to compile the launcher with the torch stable C ABI.
-
-    Defaults to enabled for torch >= 2.11, which is the first release whose
-    stable ABI registers all ScalarType cases humming relies on, including
-    Float8_e8m0fnu (added in pytorch/pytorch#173669, gated by
-    TORCH_FEATURE_VERSION >= TORCH_VERSION_2_11_0). On torch 2.10.x the
-    stable ABI is missing Float8_e8m0fnu (ScalarType 44), so passing a
-    UE8M0 weight scale through ``torch.ops.humming.launch_kernel`` fails
-    with ``RuntimeError: Not yet supported ScalarType 44``.
-
-    The default can be overridden via the ``HUMMING_USE_TORCH_STABLE_API``
-    environment variable for users who want to force one path or the other
-    (e.g. to test the stable ABI on an older torch with a custom build).
-    """
     from packaging.version import Version
 
     override = os.environ.get("HUMMING_USE_TORCH_STABLE_API")
     if override is not None:
         return override.strip().lower() in ("1", "true", "yes", "on")
     return Version(torch.__version__) >= Version("2.11")
+
+
+def _get_precompiled_launcher_path() -> Path | None:
+    from packaging.version import Version
+
+    if Version(torch.__version__) < Version("2.11"):
+        return None
+
+    humming_dir = Path(__file__).parents[1]
+    csrc_dir = humming_dir / "csrc" / "launcher"
+    return jit_utils.get_precompiled_artifact_path(csrc_dir, "libhumming_launcher.so")
 
 
 def init_humming_launcher():
@@ -102,6 +206,14 @@ def init_humming_launcher():
     USE_TORCH_STABLE_API = _resolve_use_torch_stable_api()
     lock_filename = jit_utils.get_humming_lock_filename("launcher")
     with FileLock(lock_filename):
+        if _launcher_inited:
+            return
+        precompiled_path = _get_precompiled_launcher_path() if USE_TORCH_STABLE_API else None
+        if precompiled_path is not None:
+            torch.ops.load_library(str(precompiled_path))
+            _launcher_inited = True
+            return
+
         import humming
 
         build_dir = get_humming_launcher_build_dir(USE_TORCH_STABLE_API)
@@ -116,13 +228,18 @@ def init_humming_launcher():
             required_headers=["cuda.h", "crt/host_defines.h", "cuda/std/cstdint"],
         )
 
+        extra_cflags = ["-O3", f"-DUSE_TORCH_STABLE_API={int(USE_TORCH_STABLE_API)}"]
+        if USE_TORCH_STABLE_API:
+            extra_cflags.append("-DTORCH_TARGET_VERSION=0x020B000000000000")
+
         torch.utils.cpp_extension.load(
             name="humming_launcher",
             sources=[filename],
             extra_include_paths=list(cuda_env["include_paths"]),
             extra_ldflags=["-lcuda", "-lc10_cuda", "-ltorch_cuda"],
-            extra_cflags=["-O3", f"-DUSE_TORCH_STABLE_API={int(USE_TORCH_STABLE_API)}"],
+            extra_cflags=extra_cflags,
             build_directory=build_dir,
+            is_python_module=False,
         )
 
         _launcher_inited = True

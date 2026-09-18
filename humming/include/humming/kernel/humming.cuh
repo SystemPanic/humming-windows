@@ -34,10 +34,11 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaB>::Type B,
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaC>::Type C,
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaAS>::Type AS,
+    const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaAS2>::Type AS2,
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaBS>::Type BS,
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaBZP>::Type BZP,
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaBias>::Type Bias,
-    const uint32_t *GS,
+    const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaBS2>::Type BS2,
     const uint32_t *sorted_ids_ptr,
     const uint32_t *expert_ids_ptr,
     const uint32_t *num_tokens_padded_ptr,
@@ -48,8 +49,10 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
     uint32_t top_k,
     bool use_int64_expert_layout) {
 
+  uint64_t debug_start_clock = debug_kernel_timer_start();
   constexpr uint32_t kNumThreads = TuningConfig::kNumThreads;
   constexpr uint32_t kNumStages = TuningConfig::kNumStages;
+  constexpr bool kUsePdl = TuningConfig::kUsePdl;
 
   using SharedStorage = SharedStorage<
       MmaOpClass, BlockShape, WarpShape, ElementA, ElementB, ElementBS,
@@ -72,8 +75,8 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
 
   const KernelParams params{
       shape_m, top_k, use_int64_expert_layout,
-      param_to_ptr(A), param_to_ptr(B), param_to_ptr(AS), param_to_ptr(BS),
-      param_to_ptr(BZP), param_to_ptr(Bias), param_to_ptr(C), GS,
+      param_to_ptr(A), param_to_ptr(B), param_to_ptr(AS), param_to_ptr(AS2), param_to_ptr(BS),
+      param_to_ptr(BZP), param_to_ptr(Bias), param_to_ptr(C), param_to_ptr(BS2),
       sorted_ids_ptr, expert_ids_ptr, num_tokens_padded_ptr, expert_layout_ptr,
       tensor_map_buffer, locks};
   auto ctx = Ctx(smem, params);
@@ -88,58 +91,94 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   auto s2r_pipe = S2RMemoryPipeline(ctx, mma, epilogue);
 
   producer.init_mbarrier();
-  __syncthreads();
+  mbarrier_init_sync<((TuningConfig::kMultiCastSizeA * TuningConfig::kMultiCastSizeB) > 1)>();
 
+  bool pdl_waited = false;
   while (scheduler.get_next_block()) {
+    debug_kernel_timeout_check(debug_start_clock);
     mma.zero_accum();
     __syncthreads();
 
     uint32_t &slice_iters = scheduler.slice_iters;
+    constexpr uint32_t kStaticSliceIters = ProblemShape::K / BlockShape::K;
+    const uint32_t num_slice_iters = Ctx::kUseStreamK ? slice_iters : kStaticSliceIters;
     producer.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.k_block_id, scheduler.current_shape_m, scheduler.m_offset);
+    s2r_pipe.seek(scheduler.m_offset);
+    if constexpr (Ctx::kUseTmaA) producer.prefetch_stage();
     epilogue.seek(scheduler.expert_id, scheduler.m_block_id, scheduler.n_block_id, scheduler.current_shape_m, scheduler.m_offset);
     epilogue.set_streamk_state(scheduler.slice_count, scheduler.slice_id, scheduler.locks_offset);
 
-    if constexpr (TuningConfig::kUseTmaC) tma_wait_store_group<0, true>();
+    if constexpr (TuningConfig::kUseTmaC) {
+      tma_wait_store_group<0, true>();
+      __syncthreads();
+    }
+    if constexpr (kUsePdl) {
+      if (!pdl_waited) {
+        griddepcontrol_wait();
+        if (threadIdx.x == 0) griddepcontrol_launch_dependents();
+        pdl_waited = true;
+      }
+    }
     producer.template load_stage<true, true>(0);
     PRAGMA_UNROLL
     for (uint32_t stage_id = 1; stage_id < MAX(kNumStages - 1, 2); stage_id++) {
-      producer.load_stage(stage_id, stage_id < slice_iters);
+      producer.load_stage(stage_id, stage_id < num_slice_iters);
     };
 
     consumer.template wait_stage<true>(kNumStages);
     s2r_pipe.template load_stage_iter<true>(0, 0);
-    mma.transform_b(0);
+    mma.transform_b(0, 0);
 
-    while (slice_iters) {
+    auto consume_stage = [&](auto stage, uint32_t slice_iter) {
+      constexpr uint32_t stage_id = decltype(stage)::value;
+      debug_kernel_timeout_check(debug_start_clock);
+      const uint32_t remaining_iters = num_slice_iters - slice_iter;
+      if (remaining_iters == 1) producer.load_channel();
       PRAGMA_UNROLL
-      for (uint32_t stage_id = 0; stage_id < kNumStages; stage_id++) {
-        if (slice_iters == 1) producer.load_channel();
-        PRAGMA_UNROLL
-        for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
-          s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
-          mma.run(stage_id, warp_iter_id);
-          if (warp_iter_id == Ctx::kWarpIters - 2) {
-            if constexpr (kNumStages == 2) {
-              __syncthreads();
-              if (slice_iters > 1) consumer.wait_stage((stage_id + 1) % kNumStages);
-              producer.load_stage(stage_id, slice_iters > kNumStages);
-            } else {
-              producer.load_stage(stage_id + kNumStages - 1, slice_iters >= kNumStages);
-              if (slice_iters > 1) consumer.wait_stage((stage_id + 1) % kNumStages);
-            }
-          }
-
-          mma.transform_b((warp_iter_id + 1) % 2);
+      for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
+        if (warp_iter_id == Ctx::kWarpIters - 1 && remaining_iters > 1) {
+          consumer.wait_stage((stage_id + 1) % kNumStages);
         }
-
-        slice_iters--;
-        if (!slice_iters) break;
-      };
+        s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
+        mma.run(stage_id, warp_iter_id);
+        if (warp_iter_id == Ctx::kWarpIters - 2) {
+          __syncthreads();
+          if constexpr (kNumStages > 2) {
+            producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+          }
+        }
+        mma.transform_b(
+            (warp_iter_id + 1) % 2,
+            (warp_iter_id + 1) % Ctx::kWarpIters);
+      }
+      if constexpr (kNumStages == 2) {
+        producer.load_stage(stage_id, remaining_iters > kNumStages);
+      }
     };
+
+    const uint32_t num_full_stage_cycles = num_slice_iters / kNumStages;
+    for (uint32_t cycle_id = 0; cycle_id < num_full_stage_cycles; cycle_id++) {
+      static_for<0, kNumStages>([&](auto stage) {
+        consume_stage(stage, cycle_id * kNumStages + decltype(stage)::value);
+      });
+    }
+    const uint32_t tail_stage_iters = num_slice_iters % kNumStages;
+    static_for<0, kNumStages>([&](auto stage) {
+      constexpr uint32_t stage_id = decltype(stage)::value;
+      if (stage_id < tail_stage_iters) {
+        consume_stage(stage, num_full_stage_cycles * kNumStages + stage_id);
+      }
+    });
 
     consumer.wait_channel();
     s2r_pipe.load_channel(scheduler.slice_id);
     __syncthreads();
     epilogue.call(mma.final_regs_c_as_ptr());
+  }
+
+  __syncthreads();
+  if constexpr (TuningConfig::kMultiCastSizeA * TuningConfig::kMultiCastSizeB > 1) {
+    asm volatile("barrier.cluster.arrive;\n");
+    asm volatile("barrier.cluster.wait;\n");
   }
 };

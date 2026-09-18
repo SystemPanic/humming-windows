@@ -33,6 +33,31 @@ CUDA_INLINE void tma_load_1d(const void *desc_ptr, void *smem_ptr, void *mbar_pt
   }
 };
 
+CUDA_INLINE void tma_prefetch_1d(const void *desc_ptr, uint32_t crd0) {
+  uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+  asm volatile("cp.async.bulk.prefetch.tensor.1d.L2.global [%0, {%1}];"
+               :
+               : "l"(gmem_int_desc), "r"(crd0)
+               : "memory");
+}
+
+CUDA_INLINE void tma_prefetch_2d(const void *desc_ptr, uint32_t crd0, uint32_t crd1) {
+  uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+  asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global [%0, {%1, %2}];"
+               :
+               : "l"(gmem_int_desc), "r"(crd0), "r"(crd1)
+               : "memory");
+}
+
+CUDA_INLINE void tma_prefetch_3d(
+    const void *desc_ptr, uint32_t crd0, uint32_t crd1, uint32_t crd2) {
+  uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+  asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global [%0, {%1, %2, %3}];"
+               :
+               : "l"(gmem_int_desc), "r"(crd0), "r"(crd1), "r"(crd2)
+               : "memory");
+}
+
 template <uint32_t kMultiCastSize = 1>
 CUDA_INLINE void tma_load_2d(const void *desc_ptr, void *smem_ptr, void *mbar_ptr, uint32_t crd0, uint32_t crd1) {
   uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
@@ -99,15 +124,20 @@ CUDA_INLINE void tma_reduce_add_2d(void *smem_ptr, const void *desc_ptr, uint32_
                : "memory");
 };
 
-CUDA_INLINE void tma_commit_mbarrier(void *mbar_ptr, uint32_t bytes) {
+CUDA_INLINE void tma_expect_tx(void *mbar_ptr, uint32_t bytes) {
   uint32_t smem_int_ptr = cast_smem_ptr_to_uint(mbar_ptr);
   asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
                :
-               : "r"(smem_int_ptr), "r"(bytes));
+               : "r"(smem_int_ptr), "r"(bytes)
+               : "memory");
 };
 
 CUDA_INLINE void tma_commit_store_group() {
   asm volatile("cp.async.bulk.commit_group;\n");
+};
+
+CUDA_INLINE void tma_fence_async_shared() {
+  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 };
 
 template <uint32_t N, bool only_wait_read = false>

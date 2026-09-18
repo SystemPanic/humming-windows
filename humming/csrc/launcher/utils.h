@@ -1,5 +1,10 @@
 #pragma once
 
+#include <cuda.h>
+#include <string>
+
+#include "./torch_api.h"
+
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
 inline void check_curesult(const CUresult res, const char *func_name) {
@@ -10,6 +15,51 @@ inline void check_curesult(const CUresult res, const char *func_name) {
     cuGetErrorString(res, &errStr);
     ASSERT_CHECK(false, func_name, " failed with error: ", errName, " (", errStr, ")");
   }
+}
+
+class DeviceContextGuard {
+public:
+  explicit DeviceContextGuard(int64_t dev) {
+    check_curesult(cuDeviceGet(&device_, dev), "cuDeviceGet");
+    CUcontext current_context;
+    check_curesult(cuCtxGetCurrent(&current_context), "cuCtxGetCurrent");
+    if (current_context != nullptr) {
+      CUdevice current_device;
+      check_curesult(cuCtxGetDevice(&current_device), "cuCtxGetDevice");
+      if (current_device == device_) return;
+    }
+    check_curesult(cuDevicePrimaryCtxRetain(&context_, device_), "cuDevicePrimaryCtxRetain");
+    check_curesult(cuCtxPushCurrent(context_), "cuCtxPushCurrent");
+    active_ = true;
+  }
+
+  ~DeviceContextGuard() {
+    if (!active_) return;
+    CUcontext context;
+    cuCtxPopCurrent(&context);
+    cuDevicePrimaryCtxRelease(device_);
+  }
+
+private:
+  CUdevice device_;
+  CUcontext context_;
+  bool active_ = false;
+};
+
+inline CUcontext get_current_context() {
+  CUcontext context;
+  check_curesult(cuCtxGetCurrent(&context), "cuCtxGetCurrent");
+  return context;
+}
+
+inline CUstream get_current_cuda_stream(int64_t dev) {
+#if USE_TORCH_STABLE_API
+  void *stream_ptr = nullptr;
+  aoti_torch_get_current_cuda_stream(dev, &stream_ptr);
+  return static_cast<CUstream>(stream_ptr);
+#else
+  return at::cuda::getCurrentCUDAStream(dev);
+#endif
 }
 
 uint32_t manual_crc32(const std::string &data) {
@@ -58,9 +108,6 @@ ScalarType dtype_id_to_tensor_dtype(uint32_t dtype_id) {
 };
 
 struct KernelData {
-  CUmodule module;
-  CUfunction func;
-
   uint32_t smem_size;
   uint32_t num_threads;
   uint32_t a_dtype_id;
@@ -82,6 +129,7 @@ struct KernelData {
   uint32_t multi_cast_size_a;
   uint32_t multi_cast_size_b;
   uint32_t gemm_type_id;
+  uint32_t mma_type_id;
 
   bool use_stream_k;
   bool is_fp_zero_point;
@@ -89,19 +137,34 @@ struct KernelData {
   bool is_group_weight_scale;
   bool is_block_weight_scale;
   bool is_tensor_weight_scale;
+  bool is_channel_weight_scale_2;
+  bool is_tensor_weight_scale_2;
   bool has_zero_point;
   bool has_bias;
+  bool has_input_scale_2;
+  bool is_tensor_input_scale;
+  bool is_tensor_input_scale_2;
   bool use_m_major_input_scale;
   bool use_tma_a;
   bool use_tma_as;
+  bool use_tma_as2;
   bool use_tma_b;
   bool use_tma_c;
   bool use_tma_bs;
+  bool use_tma_bs2;
   bool use_tma_bzp;
   bool use_tma_bias;
+  bool use_pdl;
+  bool use_packed_k_layout;
+};
+
+struct LoadedKernel {
+  CUmodule module;
+  CUfunction func;
 };
 
 struct KernelLaunchData {
-  KernelData kernel_data;
+  KernelData metadata;
+  CUfunction func;
   int64_t num_sms;
 };

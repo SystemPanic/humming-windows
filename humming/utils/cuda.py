@@ -104,9 +104,7 @@ def _find_nvidia_pypi_cuda_paths():
         if not os.path.isdir(nvidia_root) or nvidia_root in seen:
             continue
         seen.add(nvidia_root)
-        if any(
-            os.path.isdir(os.path.join(nvidia_root, sub)) for sub in ("cuda_runtime", "cuda_nvcc")
-        ):
+        if any(os.path.isdir(os.path.join(nvidia_root, sub)) for sub in ("cuda_runtime", "cuda_nvcc")):
             results.append(
                 {
                     "source": "pypi",
@@ -208,6 +206,8 @@ def find_all_cuda_paths():
     results = []
     seen_real = set()
     candidates = ["/usr/local/cuda"] + sorted(glob.glob("/usr/local/cuda-*"))
+    if "PPU_SDK" in os.environ:
+        candidates.append(os.path.join(os.environ["PPU_SDK"], "CUDA_SDK"))
     if "CUDA_HOME" in os.environ:
         candidates.append(os.environ["CUDA_HOME"])
 

@@ -19,6 +19,7 @@ private:
   using GmemWriter = EpilogueGmemWriter<Ctx, ArithClass>;
 
   static constexpr bool kIsGroupedGemm = Ctx::kIsGroupedGemm;
+  static constexpr bool kHasTensorInputScale = Ctx::kIsTensorInputScale || Ctx::kIsTensorInputScale2;
   static constexpr uint32_t kNumWriteSplits = Ctx::kNumWriteSplits;
 
 public:
@@ -38,8 +39,11 @@ public:
       : ctx(ctx), locks(ctx.params.locks), arith(arith),
         smem_reducer(ctx), smem_writer(ctx, arith), gmem_writer(ctx, arith) {
     if constexpr (Ctx::kUseTmaC) {
-      if constexpr (kIsGroupedGemm) gmem_writer.update_tensor_map_ptr(ctx.params.tensor_map_buffer + blockIdx.x);
-      else if (threadIdx.x == 0) prefetch_tensor_map(ctx.params.c);
+      if constexpr (kIsGroupedGemm) {
+        gmem_writer.update_tensor_map_ptr(ctx.params.tensor_map_buffer + blockIdx.x);
+      } else if constexpr (!Ctx::kUseWarpSpec) {
+        if (threadIdx.x == 0) prefetch_tensor_map(ctx.params.c);
+      }
     }
     ctx.sync_math_threads();
   }
@@ -59,6 +63,9 @@ public:
     PRAGMA_UNROLL
     for (uint32_t i = 0; i < kNumWriteSplits; i++) {
       smem_writer.write(regs_c_ptr, slice_count, i);
+      if constexpr (Ctx::kUseTmaC) {
+        if (ctx.is_math_thread()) tma_fence_async_shared();
+      }
       ctx.sync_math_threads();
       gmem_writer.write(slice_id, slice_count, i);
       ctx.sync_math_threads();
@@ -89,8 +96,13 @@ public:
   CUDA_INLINE
   void seek(uint32_t expert_id, uint32_t m_block_id, uint32_t n_block_id, uint32_t current_shape_m, uint32_t m_offset) {
     gmem_writer.seek(m_block_id, n_block_id, current_shape_m, m_offset);
-    if constexpr (Ctx::kIsTensorWeightScale) {
-      arith.gs = ctx.params.gs[Ctx::kIsDenseGemm ? 0 : expert_id];
+    if constexpr (kHasTensorInputScale) {
+      const uint32_t *as_ptr = reinterpret_cast<const uint32_t *>(Ctx::kIsTensorInputScale2 ? ctx.params.as2 : ctx.params.as);
+      arith.as[0] = as_ptr[0];
+    }
+    if constexpr (Ctx::kHasTensorWeightScale) {
+      const uint32_t *gs_ptr = reinterpret_cast<const uint32_t *>(Ctx::kIsTensorWeightScale2 ? ctx.params.bs2 : ctx.params.bs);
+      arith.gs = gs_ptr[Ctx::kIsDenseGemm ? 0 : expert_id];
     }
   };
 

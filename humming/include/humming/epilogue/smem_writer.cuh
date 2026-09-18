@@ -138,6 +138,14 @@ public:
       }
 
       if constexpr (kUseWgmma) shlf_trans_mma_c(val);
+      if constexpr (USE_PPU && sizeof(ValTypeC) == 2) {
+        // PPU use_f16_accum requires an additional accumulator layout conversion.
+        uint32_t &bits = *reinterpret_cast<uint32_t *>(&val);
+        uint32_t source_lane = (laneid >> 1) & 1u;
+        uint32_t even = __shfl_sync(0xffffffff, bits, source_lane, 4);
+        uint32_t odd = __shfl_sync(0xffffffff, bits, source_lane + 2, 4);
+        bits = __byte_perm(even, odd, (laneid & 1u) ? 0x7632 : 0x5410);
+      }
       if constexpr (sizeof(ValTypeC) != 4) {
         val_half2 = val;
       } else if constexpr (kIsIntAccum) {
@@ -200,8 +208,8 @@ public:
         for (uint32_t m = 0; m < inner_m; m++) {
           PRAGMA_UNROLL
           for (uint32_t n = 0; n < inner_n; n++) {
-            uint32_t row_index = i * inner_m + m;
-            uint32_t col_index = j * inner_n + n;
+            uint32_t row_index = i * inner_m + (USE_PPU ? n : m);
+            uint32_t col_index = j * inner_n + (USE_PPU ? m : n);
             write_to_smem(part_regs[n * inner_m + m], row_index, col_index);
           }
         }

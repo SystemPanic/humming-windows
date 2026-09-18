@@ -28,10 +28,16 @@ private:
   static constexpr uint32_t kWeightScaleGroupSize = Ctx::kWeightScaleGroupSize > 0 ? Ctx::kWeightScaleGroupSize : 1;
   static constexpr uint32_t kMaxGroupSize = MAX(kInputScaleGroupSize, kWeightScaleGroupSize);
 
+  static constexpr bool kUseMxmma = Ctx::kUseMxmma;
+  static constexpr uint32_t kAsBlocksPerWord = kUseMxmma ? MAX(1u, 4 * kInputScaleGroupSize / BlockShape::K) : 1;
+
   static constexpr uint32_t N_BLOCKS = ProblemShape::N / BlockShape::N / kMultiCastSizeA;
   static constexpr uint32_t K_BLOCKS = ProblemShape::K / BlockShape::K;
 
   static constexpr uint32_t kRasterGroupM = Ctx::kRasterGroupM;
+  static constexpr uint32_t kNumStages = Ctx::TuningConfig::kNumStages;
+
+  static constexpr int32_t ct_gcd(int32_t a, int32_t b) { return b == 0 ? a : ct_gcd(b, a % b); }
 
   uint32_t m_blocks;
   uint32_t mn_blocks;
@@ -54,9 +60,9 @@ public:
 
   // for stream-k
   uint32_t slice_iters;
-  uint32_t slice_count;
-  uint32_t slice_id;
-  uint32_t locks_offset;
+  uint32_t slice_count = 1;
+  uint32_t slice_id = 0;
+  uint32_t locks_offset = 0;
 
   // for tma multi-cast
   uint32_t cluster_rank = blockIdx.x % kMultiCastSize;
@@ -68,7 +74,9 @@ public:
   // for grouped gemm
   uint32_t current_shape_m;
   uint32_t expert_max_num_tokens;
-  uint32_t offset_in_expert = 0;
+  uint32_t m_block_in_expert = 0;
+  uint32_t current_expert_num_tokens = 0;
+  uint32_t current_expert_m_blocks = 0;
   uint32_t m_offset = 0;
 
   CUDA_INLINE
@@ -82,6 +90,10 @@ public:
     current_shape_m = ctx.params.shape_m;
     expert_max_num_tokens = ctx.params.shape_m / Ctx::kNumExperts;
     calc_m_blocks();
+    if constexpr (kIsGroupedGemm) {
+      current_expert_num_tokens = ctx.smem.expert_tokens[0];
+      current_expert_m_blocks = CEIL_DIV(current_expert_num_tokens, BlockShape::M);
+    }
     mn_blocks = m_blocks * N_BLOCKS;
     mnk_blocks = mn_blocks * K_BLOCKS;
     uint32_t kNumCtaGroups = gridDim.x / kMultiCastSize;
@@ -99,10 +111,11 @@ public:
 
       streamk_mnk_total_iters = CEIL_DIV(streamk_mnk_blocks, kNumCtaGroups);
 
-      constexpr int32_t blocks_per_group = kMaxGroupSize / BlockShape::K;
-
-      if constexpr (blocks_per_group > 1) {
-        streamk_mnk_total_iters = blocks_per_group * CEIL_DIV(streamk_mnk_total_iters, blocks_per_group);
+      constexpr int32_t blocks_per_group = MAX(kMaxGroupSize / BlockShape::K, kAsBlocksPerWord);
+      constexpr int32_t bpg = blocks_per_group > 1 ? blocks_per_group : 1;
+      constexpr int32_t align_iters = bpg / ct_gcd(bpg, (int32_t)kNumStages) * (int32_t)kNumStages;
+      if constexpr (align_iters > 1) {
+        streamk_mnk_total_iters = align_iters * CEIL_DIV(streamk_mnk_total_iters, align_iters);
       };
 
       streamk_mnk_next_index = kNumCtaGroups * dp_mn_iters * K_BLOCKS + streamk_mnk_total_iters * (blockIdx.x / kMultiCastSize);
@@ -114,15 +127,14 @@ public:
         if (streamk_mnk_iters > streamk_mnk_total_iters) streamk_mnk_iters = streamk_mnk_total_iters;
       };
     } else {
-      dp_mn_iters = mn_blocks / kNumCtaGroups;
-      if (blockIdx.x / kMultiCastSize < mn_blocks % kNumCtaGroups) { dp_mn_iters += 1; };
+      dp_mn_next_index = blockIdx.x / kMultiCastSize;
+      dp_mn_iters = dp_mn_next_index < mn_blocks;
     }
 
     dp_mn_total_iters = dp_mn_iters;
-    slice_count = 1;
-    slice_id = 0;
-
-    if (dp_mn_iters) { dp_mn_next_index = blockIdx.x / kMultiCastSize; };
+    if constexpr (kUseStreamK) {
+      if (dp_mn_iters) dp_mn_next_index = blockIdx.x / kMultiCastSize;
+    }
   };
 
   CUDA_INLINE
@@ -149,30 +161,25 @@ public:
       if constexpr (kUseCpAsync) cp_async_wait_group<0>();
       __syncthreads();
 
-      if constexpr (kIsGroupedContiguousGemm) {
-        ctx.smem.expert_tokens[kNumExperts - 1] = ctx.params.shape_m - ctx.smem.expert_offset[kNumExperts - 1];
-        PRAGMA_UNROLL
-        for (uint32_t i = 0; i < CEIL_DIV(kNumExperts - 1, kNumThreads); i++) {
-          uint32_t index = kNumThreads * i + threadIdx.x;
-          if (index < kNumExperts - 1) {
-            ctx.smem.expert_tokens[index] = ctx.smem.expert_offset[index + 1] - ctx.smem.expert_offset[index];
-          }
-        }
-
-        __syncthreads();
-      }
-
       if (ctx.warp_id() == 0) {
         uint32_t tmp_m_blocks = 0;
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < CEIL_DIV(kNumExperts, 32); i++) {
           uint32_t index = 32 * i + threadIdx.x;
           if (index < kNumExperts) {
-            tmp_m_blocks += CEIL_DIV(ctx.smem.expert_tokens[index], BlockShape::M);
+            uint32_t expert_tokens;
+            if constexpr (kIsGroupedContiguousGemm) {
+              uint32_t next_offset =
+                  index + 1 < kNumExperts ? ctx.smem.expert_offset[index + 1] : ctx.params.shape_m;
+              expert_tokens = next_offset - ctx.smem.expert_offset[index];
+              ctx.smem.expert_tokens[index] = expert_tokens;
+            } else {
+              expert_tokens = ctx.smem.expert_tokens[index];
+            }
+            tmp_m_blocks += CEIL_DIV(expert_tokens, BlockShape::M);
           }
         }
 
-        __syncwarp();
         m_blocks = warp_reduce_add(tmp_m_blocks);
         if (threadIdx.x == 0) ctx.smem.total_m_blocks[0] = m_blocks;
       }
@@ -213,7 +220,8 @@ public:
       }
       k_block_id = 0;
       dp_mn_next_index += gridDim.x / kMultiCastSize;
-      dp_mn_iters--;
+      if constexpr (kUseStreamK) dp_mn_iters--;
+      else dp_mn_iters = dp_mn_next_index < mn_blocks;
       has_next_block = true;
     } else if constexpr (kUseStreamK) {
       has_next_block = get_streamk_next_block();
@@ -272,20 +280,23 @@ public:
   CUDA_INLINE
   void fetch_moe_group_block() {
     uint32_t delta_m_block_id = m_block_id - old_m_block_id;
-    offset_in_expert += delta_m_block_id * BlockShape::M;
+    m_block_in_expert += delta_m_block_id;
 
-    while (offset_in_expert >= ctx.smem.expert_tokens[expert_id]) {
-      offset_in_expert -= CEIL_DIV(ctx.smem.expert_tokens[expert_id], BlockShape::M) * BlockShape::M;
+    while (m_block_in_expert >= current_expert_m_blocks) {
+      m_block_in_expert -= current_expert_m_blocks;
       expert_id++;
+      current_expert_num_tokens = ctx.smem.expert_tokens[expert_id];
+      current_expert_m_blocks = CEIL_DIV(current_expert_num_tokens, BlockShape::M);
     }
 
     old_m_block_id = m_block_id;
+    uint32_t offset_in_expert = m_block_in_expert * BlockShape::M;
     if constexpr (Ctx::kIsGroupedMaskedGemm) {
       m_offset = expert_id * expert_max_num_tokens + offset_in_expert;
-      current_shape_m = expert_id * expert_max_num_tokens + ctx.smem.expert_tokens[expert_id];
+      current_shape_m = expert_id * expert_max_num_tokens + current_expert_num_tokens;
     } else if constexpr (Ctx::kIsGroupedContiguousGemm) {
       m_offset = ctx.smem.expert_offset[expert_id] + offset_in_expert;
-      current_shape_m = ctx.smem.expert_offset[expert_id] + ctx.smem.expert_tokens[expert_id];
+      current_shape_m = ctx.smem.expert_offset[expert_id] + current_expert_num_tokens;
     }
 
     if (old_expert_id != expert_id) update_tensor_map_c();
@@ -294,15 +305,14 @@ public:
 
   CUDA_INLINE
   void fetch_moe_index_block() {
-    if (kUseWarpSpec && ctx.is_math_thread()) return;
-
     expert_id = ctx.params.expert_ids_ptr[m_block_id];
+    if (kUseWarpSpec && ctx.is_math_thread()) return;
 
     const uint32_t *gmem_ptr = ctx.params.sorted_ids_ptr + m_block_id * BlockShape::M;
     const int4 *gmem_ptr_load = reinterpret_cast<const int4 *>(gmem_ptr);
     int4 *smem_ptr_load = reinterpret_cast<int4 *>(ctx.smem.wr_row_index);
 
-    legacy_load_1d<kUseCpAsync, BlockShape::M / 4, kNumLoadThreads>(gmem_ptr_load, smem_ptr_load);
+    legacy_load_1d<kUseCpAsync, BlockShape::M / 4, kNumLoadThreads, kLoadThreadOffset>(gmem_ptr_load, smem_ptr_load);
     if constexpr (kUseCpAsync) cp_async_commit_group();
     if constexpr (kUseCpAsync) cp_async_wait_group<0>();
 
@@ -326,6 +336,7 @@ public:
   void update_tensor_map_c() {
     if constexpr (kIsGroupedGemm && Ctx::kUseTmaC) {
       if (threadIdx.x < 32) {
+        tma_wait_store_group<0>();
         __syncwarp();
         if (threadIdx.x == 0) {
           tensor_map_replace_global_dim<1>(ctx.smem.tensor_map_buffer, current_shape_m);

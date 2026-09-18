@@ -4,7 +4,7 @@ from typing import Any
 import torch
 
 from humming import dtypes
-from humming.config.enum import WeightScaleType
+from humming.config.enum import InputQuantizationMode, WeightScale2Type, WeightScaleType
 from humming.schema.base import BaseInputSchema, BaseWeightSchema
 from humming.schema.humming import HummingInputSchema, HummingWeightSchema
 
@@ -84,7 +84,16 @@ class ModeloptNvfp4WeightSchema(ModeloptWeightSchema):
         has_bias = "bias" in tensors
         return shape_n, shape_k, None, has_bias
 
-    def convert_humming(
+    def to_humming_schema(self, param_dtype: torch.dtype) -> HummingWeightSchema:
+        return HummingWeightSchema(
+            b_dtype=dtypes.float4e2m1,
+            bs_dtype=dtypes.float8e4m3,
+            weight_scale_group_size=16,
+            weight_scale_type=WeightScaleType.GROUP,
+            weight_scale_2_type=WeightScale2Type.TENSOR,
+        )
+
+    def _convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
         shape_n_stacks: list[int],
@@ -96,10 +105,10 @@ class ModeloptNvfp4WeightSchema(ModeloptWeightSchema):
         weight_scale = tensors["weight_scale"].view(torch.float8_e4m3fn)
 
         target_group_size = 16 if len(shape_k_stacks) > 1 else None
-        global_scale = tensors["weight_scale_2"].view(num_experts or 1, -1)
+        weight_scale_2 = tensors["weight_scale_2"].view(num_experts or 1, -1)
 
-        global_scale = self._may_process_global_scale(
-            global_scale,
+        weight_scale_2 = self._may_process_global_scale(
+            weight_scale_2,
             shape_n_stacks=shape_n_stacks,
             shape_k_stacks=shape_k_stacks,
             num_experts=num_experts,
@@ -107,13 +116,13 @@ class ModeloptNvfp4WeightSchema(ModeloptWeightSchema):
         )
 
         output_tensors = {"weight": weight, "weight_scale": weight_scale}
-        has_global_scale = global_scale.nelement() == (num_experts or 1)
-        if has_global_scale:
-            weight_scale_type = WeightScaleType.GROUP_TENSOR
-            output_tensors["global_scale"] = global_scale.view((num_experts or 1))
+        has_tensor_scale = weight_scale_2.nelement() == (num_experts or 1)
+        if has_tensor_scale:
+            weight_scale_2_type = WeightScale2Type.TENSOR
+            output_tensors["weight_scale_2"] = weight_scale_2.view((num_experts or 1)).float()
         else:
-            weight_scale_type = WeightScaleType.GROUP
-            weight_scale = weight_scale.float() * global_scale.float()
+            weight_scale_2_type = WeightScale2Type.NONE
+            weight_scale = weight_scale.float() * weight_scale_2.float()
             output_tensors["weight_scale"] = weight_scale.to(param_dtype)
 
         if "bias" in tensors:
@@ -121,9 +130,10 @@ class ModeloptNvfp4WeightSchema(ModeloptWeightSchema):
 
         schema = HummingWeightSchema(
             b_dtype=dtypes.float4e2m1,
-            bs_dtype=dtypes.float8e4m3 if has_global_scale else None,
+            bs_dtype=dtypes.float8e4m3 if has_tensor_scale else None,
             weight_scale_group_size=16,
-            weight_scale_type=weight_scale_type,
+            weight_scale_type=WeightScaleType.GROUP,
+            weight_scale_2_type=weight_scale_2_type,
         )
 
         return schema, output_tensors
@@ -170,7 +180,14 @@ class ModeloptMxfp8WeightSchema(ModeloptWeightSchema):
         has_bias = "bias" in tensors
         return shape_n, shape_k, None, has_bias
 
-    def convert_humming(
+    def to_humming_schema(self, param_dtype: torch.dtype) -> HummingWeightSchema:
+        return HummingWeightSchema(
+            b_dtype=dtypes.float8e4m3,
+            bs_dtype=dtypes.float8e8m0,
+            weight_scale_group_size=32,
+        )
+
+    def _convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
         shape_n_stacks: list[int],
@@ -178,11 +195,7 @@ class ModeloptMxfp8WeightSchema(ModeloptWeightSchema):
         param_dtype: torch.dtype,
         num_experts: int | None = None,
     ) -> tuple[HummingWeightSchema, dict[str, torch.Tensor]]:
-        schema = HummingWeightSchema(
-            b_dtype=dtypes.float8e4m3,
-            bs_dtype=dtypes.float8e8m0,
-            weight_scale_group_size=32,
-        )
+        schema = self.to_humming_schema(param_dtype)
 
         weight = tensors["weight"].view(torch.int32)
         weight_scale = tensors["weight_scale"].view(torch.float8_e8m0fnu)
@@ -238,16 +251,32 @@ class ModeloptNvfp4InputSchema(ModeloptInputSchema):
             return self._get_input_scale_attrs(num_experts, stack_size)
         return {}
 
-    def convert_humming(
+    def to_humming_schema(self, param_dtype: torch.dtype) -> HummingInputSchema:
+        quant_mode = (
+            InputQuantizationMode.DynamicGroupToken
+            if self.dynamic
+            else InputQuantizationMode.StaticTensorDynamicGroup
+        )
+        return HummingInputSchema(
+            a_dtype=dtypes.float4e2m1,
+            input_scale_group_size=16,
+            input_quant_mode=quant_mode,
+        )
+
+    def _convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
         shape_n_stacks: list[int],
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
-        sm_version: int | tuple[int, int] | None = None,
     ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
-        a_dtype = self.get_fallback_input_dtype(dtypes.float8e4m3, sm_version)
-        group_size = 16 if a_dtype == dtypes.float4e2m1 else 0
-        schema = HummingInputSchema(a_dtype=a_dtype, input_scale_group_size=group_size)
-        return schema, {}
+        schema = self.to_humming_schema(param_dtype)
+        if schema.static_tensor_scale_name is None:
+            return schema, {}
+        output_tensors = self._convert_static_tensor_scale(
+            tensors,
+            source_name="input_scale",
+            target_name=schema.static_tensor_scale_name,
+        )
+        return schema, output_tensors

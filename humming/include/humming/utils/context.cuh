@@ -10,11 +10,12 @@ struct KernelParams {
   const void *a;
   const void *b;
   const void *as;
+  const void *as2;
   const void *bs;
   const void *bzp;
   const void *bias;
   const void *c;
-  const uint32_t *gs;
+  const void *bs2;
   const uint32_t *sorted_ids_ptr;
   const uint32_t *expert_ids_ptr;
   const uint32_t *num_tokens_padded_ptr;
@@ -53,14 +54,21 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   static constexpr bool kIsGroupedGemm = kIsGroupedContiguousGemm || kIsGroupedMaskedGemm;
 
   static constexpr bool kUseWmma = LayerConfig::kMmaType == MmaType::MMA;
+  static constexpr bool kUseUmma = LayerConfig::kMmaType == MmaType::UMMA;
   static constexpr bool kUseWgmma = LayerConfig::kMmaType == MmaType::WGMMA;
+  static constexpr bool kUseMxmma = LayerConfig::kMmaType == MmaType::MXMMA;
+
+  static constexpr bool kUsePackedKLayout = LayerConfig::kUsePackedKLayout;
+  static constexpr uint32_t kPackedKFactor = kUsePackedKLayout ? 2 : 1;
 
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
   static constexpr uint32_t N_WARPS = BlockShape::N / WarpShape::N;
   static constexpr uint32_t K_WARPS = BlockShape::K / WarpShape::K;
+  static_assert(!kUseWgmma || TuningConfig::kNumStages >= 3);
+  static_assert(!kUseWgmma || N_WARPS % 4 == 0);
 
   static constexpr uint32_t kPartMmaShapeK = 256 / ElementA::kBits;
-  static constexpr uint32_t kWarpIters = WarpShape::K / kPartMmaShapeK;
+  static constexpr uint32_t kWarpIters = kUsePackedKLayout ? (WarpShape::N / 16) : (WarpShape::K / kPartMmaShapeK);
 
   static constexpr uint32_t kUseWarpSpec = TuningConfig_::kUseWarpSpec;
   static constexpr uint32_t kNumThreads = TuningConfig_::kNumThreads;
@@ -76,21 +84,21 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   CUDA_INLINE KernelContext(SharedStorage &smem, const KernelParams &params)
       : smem(smem), params(params) {}
 
-  CUDA_INLINE const uint32_t warp_id() { return threadIdx.x / 32; }
-  CUDA_INLINE const uint32_t lane_id() { return threadIdx.x % 32; }
-  CUDA_INLINE const uint32_t load_thread_id() { return threadIdx.x - kLoadThreadOffset; }
-  CUDA_INLINE const uint32_t cluster_rank() { return blockIdx.x % kMultiCastSize; }
+  CUDA_INLINE uint32_t warp_id() { return threadIdx.x / 32; }
+  CUDA_INLINE uint32_t lane_id() { return threadIdx.x % 32; }
+  CUDA_INLINE uint32_t load_thread_id() { return threadIdx.x - kLoadThreadOffset; }
+  CUDA_INLINE uint32_t cluster_rank() { return blockIdx.x % kMultiCastSize; }
 
-  CUDA_INLINE const uint32_t m_warp_id() { return M_WARPS == 1 ? 0 : (warp_id() / N_WARPS % M_WARPS); }
-  CUDA_INLINE const uint32_t n_warp_id() { return N_WARPS == 1 ? 0 : (warp_id() % N_WARPS); }
-  CUDA_INLINE const uint32_t k_warp_id() { return K_WARPS == 1 ? 0 : (warp_id() / (M_WARPS * N_WARPS)); }
+  CUDA_INLINE uint32_t m_warp_id() { return M_WARPS == 1 ? 0 : (warp_id() / N_WARPS % M_WARPS); }
+  CUDA_INLINE uint32_t n_warp_id() { return N_WARPS == 1 ? 0 : (warp_id() % N_WARPS); }
+  CUDA_INLINE uint32_t k_warp_id() { return K_WARPS == 1 ? 0 : (warp_id() / (M_WARPS * N_WARPS)); }
 
-  CUDA_INLINE const uint32_t m_warp_offset() { return m_warp_id() * WarpShape::M; }
-  CUDA_INLINE const uint32_t n_warp_offset() { return n_warp_id() * WarpShape::N; }
-  CUDA_INLINE const uint32_t k_warp_offset() { return k_warp_id() * WarpShape::K; }
+  CUDA_INLINE uint32_t m_warp_offset() { return m_warp_id() * WarpShape::M; }
+  CUDA_INLINE uint32_t n_warp_offset() { return n_warp_id() * WarpShape::N; }
+  CUDA_INLINE uint32_t k_warp_offset() { return k_warp_id() * WarpShape::K; }
 
-  CUDA_INLINE const bool is_math_thread() { return threadIdx.x < kNumMathThreads; }
-  CUDA_INLINE const bool is_load_thread() { return threadIdx.x >= kLoadThreadOffset; }
+  CUDA_INLINE bool is_math_thread() { return threadIdx.x < kNumMathThreads; }
+  CUDA_INLINE bool is_load_thread() { return threadIdx.x >= kLoadThreadOffset; }
 
   CUDA_INLINE static void sync_math_threads() { sync_part_threads<kNumMathThreads, kNumThreads, kUseWarpSpec ? 1 : 0>(); }
   CUDA_INLINE static void sync_load_threads() { sync_part_threads<kNumLoadThreads, kNumThreads, kUseWarpSpec ? 2 : 0>(); }

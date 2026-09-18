@@ -4,7 +4,7 @@ from typing import Any
 import torch
 
 from humming import dtypes
-from humming.config.enum import WeightScaleType
+from humming.config.enum import InputQuantizationMode, WeightScale2Type, WeightScaleType
 from humming.schema.base import BaseInputSchema, BaseWeightSchema
 from humming.schema.humming import HummingInputSchema, HummingWeightSchema
 
@@ -158,7 +158,52 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
         has_bias = "bias" in tensors
         return shape_n, shape_k, None, has_bias
 
-    def convert_humming(
+    def to_humming_schema(self, param_dtype: torch.dtype) -> HummingWeightSchema:
+        if self.format in ["int-quantized", "float-quantized", "naive-quantized"]:
+            assert self.num_bits == 8
+            b_dtype = dtypes.uint8 if self.type == "int" else dtypes.float8e4m3
+            bs_dtype = dtypes.DataType.from_torch_dtype(param_dtype)
+        elif self.format == "nvfp4-pack-quantized":
+            b_dtype = dtypes.float4e2m1
+            bs_dtype = dtypes.float8e4m3
+        elif self.format == "mxfp4-pack-quantized":
+            b_dtype = dtypes.float4e2m1
+            bs_dtype = dtypes.float8e8m0
+        else:
+            assert self.format == "pack-quantized" and self.type == "int"
+            b_dtype = dtypes.DataType.from_str(f"uint{self.num_bits}")
+            bs_dtype = dtypes.DataType.from_torch_dtype(param_dtype)
+
+        group_size = 0
+        group_size_n = 0
+        if self.strategy in ["group", "tensor_group"]:
+            assert self.group_size is not None
+            group_size = self.group_size
+            scale_type = WeightScaleType.GROUP
+        elif self.strategy == "block":
+            assert self.block_structure is not None
+            group_size_n, group_size = self.block_structure
+            scale_type = WeightScaleType.BLOCK
+        elif self.strategy == "channel":
+            scale_type = WeightScaleType.CHANNEL
+        else:
+            assert self.strategy == "tensor"
+            scale_type = WeightScaleType.TENSOR
+
+        scale_2_type = (
+            WeightScale2Type.TENSOR if self.format == "nvfp4-pack-quantized" else WeightScale2Type.NONE
+        )
+        return HummingWeightSchema(
+            b_dtype=b_dtype,
+            bs_dtype=bs_dtype,
+            weight_scale_group_size=group_size,
+            weight_scale_group_size_n=group_size_n,
+            weight_scale_type=scale_type,
+            weight_scale_2_type=scale_2_type,
+            has_zero_point=not self.symmetric,
+        )
+
+    def _convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
         shape_n_stacks: list[int],
@@ -202,23 +247,24 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
         output_tensors = {"weight": weight, "weight_scale": weight_scale}
 
         weight_scale_type = None
+        weight_scale_2_type = None
         if self.format == "nvfp4-pack-quantized":
-            global_scale = tensors["weight_global_scale"]
+            weight_scale_2 = tensors["weight_global_scale"]
             target_group_size = 16 if len(shape_k_stacks) > 1 else None
-            global_scale = self._may_process_global_scale(
-                1 / global_scale,
+            weight_scale_2 = self._may_process_global_scale(
+                1 / weight_scale_2,
                 shape_n_stacks=shape_n_stacks,
                 shape_k_stacks=shape_k_stacks,
                 num_experts=num_experts,
                 target_group_size=target_group_size,
             )
-            has_global_scale = global_scale.nelement() == (num_experts or 1)
-            if has_global_scale:
-                weight_scale_type = WeightScaleType.GROUP_TENSOR
-                output_tensors["global_scale"] = global_scale
+            has_tensor_scale = weight_scale_2.nelement() == (num_experts or 1)
+            weight_scale_type = WeightScaleType.GROUP
+            if has_tensor_scale:
+                weight_scale_2_type = WeightScale2Type.TENSOR
+                output_tensors["weight_scale_2"] = weight_scale_2.float()
             else:
-                weight_scale_type = WeightScaleType.GROUP
-                weight_scale = weight_scale.float() * global_scale.float()
+                weight_scale = weight_scale.float() * weight_scale_2.float()
                 output_tensors["weight_scale"] = weight_scale.to(param_dtype)
 
         bs_dtype = None
@@ -227,7 +273,7 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
             b_dtype = dtypes.uint8 if self.type == "int" else dtypes.float8e4m3
         elif "nvfp4" in self.format:
             b_dtype = dtypes.float4e2m1
-            bs_dtype = dtypes.float8e4m3 if has_global_scale else None
+            bs_dtype = dtypes.float8e4m3 if has_tensor_scale else None
         elif "mxfp4" in self.format:
             b_dtype = dtypes.float4e2m1
             bs_dtype = dtypes.float8e8m0
@@ -248,6 +294,7 @@ class CompressedTensorsWeightSchema(BaseWeightSchema):
             bs_dtype=bs_dtype,
             weight_scale_group_size=group_size,
             weight_scale_type=weight_scale_type,
+            weight_scale_2_type=weight_scale_2_type,
             has_zero_point=not self.symmetric,
         )
 
@@ -262,7 +309,7 @@ class CompressedTensorsInputSchema(BaseInputSchema):
     type: str
     num_bits: int
     dynamic: bool | str
-    group_size: int
+    group_size: int = 0
     symmetric: bool = True
 
     def __post_init__(self):
@@ -270,9 +317,12 @@ class CompressedTensorsInputSchema(BaseInputSchema):
             "int-quantized",
             "float-quantized",
             "naive-quantized",
+            "pack-quantized",
             "nvfp4-pack-quantized",
             "mxfp4-pack-quantized",
         ]
+        if not self.symmetric:
+            raise ValueError("asymmetric input quantization is not supported by humming")
         self.input_scale_key = "input_global_scale" if "nvfp4" in self.format else "input_scale"
 
     def get_activation_bits(self):
@@ -293,38 +343,55 @@ class CompressedTensorsInputSchema(BaseInputSchema):
                 dtype=torch.float32,
                 input_scale_name=self.input_scale_key,
             )
-            if not self.symmetric:
-                assert self.type == "int" and self.num_bits == 8
-                tensors_attrs |= self._get_input_scale_attrs(
-                    num_experts=num_experts,
-                    stack_size=stack_size,
-                    dtype=torch.int8,
-                    input_scale_name="input_zero_point",
-                )
 
         return tensors_attrs
 
-    def convert_humming(
+    def to_humming_schema(self, param_dtype: torch.dtype) -> HummingInputSchema:
+        if self.type == "float" and self.num_bits == 8:
+            a_dtype = dtypes.float8e4m3
+        elif self.type == "float" and self.num_bits == 4:
+            a_dtype = dtypes.float4e2m1
+        elif self.type == "int" and self.num_bits == 8:
+            a_dtype = dtypes.int8
+        elif self.type == "int" and self.num_bits == 4:
+            a_dtype = dtypes.int4
+        else:
+            raise ValueError(f"unsupported {self.type}{self.num_bits}")
+
+        static_tensor = self.dynamic is False or self.dynamic == "local"
+        if self.group_size > 0:
+            if static_tensor:
+                quant_mode = InputQuantizationMode.StaticTensorDynamicGroup
+            elif self.format == "nvfp4-pack-quantized":
+                quant_mode = InputQuantizationMode.DynamicGroupToken
+            else:
+                quant_mode = InputQuantizationMode.DynamicGroup
+        elif static_tensor:
+            quant_mode = InputQuantizationMode.StaticTensor
+        else:
+            quant_mode = InputQuantizationMode.DynamicToken
+
+        return HummingInputSchema(
+            a_dtype=a_dtype,
+            input_scale_group_size=self.group_size,
+            input_quant_mode=quant_mode,
+        )
+
+    def _convert_humming(
         self,
         tensors: dict[str, torch.Tensor],
         shape_n_stacks: list[int],
         shape_k_stacks: list[int],
         param_dtype: torch.dtype,
         num_experts: int | None = None,
-        sm_version: int | tuple[int, int] | None = None,
     ) -> tuple[HummingInputSchema, dict[str, torch.Tensor]]:
-        if self.type == "float" and self.num_bits == 8:
-            origin_a_dtype = dtypes.float8e4m3
-        elif self.type == "float" and self.num_bits == 4:
-            origin_a_dtype = dtypes.float4e2m1
-        elif self.type == "int" and self.num_bits == 8:
-            origin_a_dtype = dtypes.int8
-        elif self.type == "int" and self.num_bits == 4:
-            origin_a_dtype = dtypes.int4
-        else:
-            raise ValueError(f"unsupported {self.type}{self.num_bits}")
-
-        a_dtype = self.get_fallback_input_dtype(origin_a_dtype, sm_version)
-        group_size = self.group_size if a_dtype == dtypes.float4e2m1 else 0
-        schema = HummingInputSchema(a_dtype=a_dtype, input_scale_group_size=group_size)
-        return schema, {}
+        schema = self.to_humming_schema(param_dtype)
+        if schema.static_tensor_scale_name is None:
+            return schema, {}
+        output_tensors = self._convert_static_tensor_scale(
+            tensors,
+            source_name=self.input_scale_key,
+            target_name=schema.static_tensor_scale_name,
+            reciprocal="nvfp4" in self.format,
+        )
+        return schema, output_tensors

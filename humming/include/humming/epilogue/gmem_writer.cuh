@@ -132,10 +132,12 @@ public:
         tma_store_2d(ctx.smem.reduce + smem_offset, tensor_map_ptr, col_offset2, row_offset);
       } else if (slice_count == 1 || slice_id == 0) {
         tma_store_2d(ctx.smem.reduce + smem_offset, tensor_map_ptr, col_offset2, row_offset);
-        if (slice_count > 1) tma_wait_store_group<0>();
       } else {
         tma_reduce_add_2d(ctx.smem.reduce + smem_offset, tensor_map_ptr, col_offset2, row_offset);
-        if (slice_id != slice_count - 1) tma_wait_store_group<0>();
+      }
+      tma_commit_store_group();
+      if constexpr (kUseStreamK) {
+        if (slice_count > 1 && slice_id != slice_count - 1) tma_wait_store_group<0>();
       }
     }
   }
@@ -148,14 +150,14 @@ public:
     } else {
       row_offset = m_block_id * BlockShape::M;
     }
-    block_output_shape_m = MIN(output_shape_m - row_offset, BlockShape::M);
+    block_output_shape_m = row_offset < output_shape_m ? MIN(output_shape_m - row_offset, BlockShape::M) : 0;
     col_offset = n_block_id * BlockShape::N;
 
     uint32_t offset;
     offset = n_block_id * (BlockShape::N * 2 / 16);
     if constexpr (!kIsIndexedGemm) {
       constexpr uint32_t kShapeN = ProblemShape::N - PadShape::N;
-      offset += row_offset * (kShapeN / 8);
+      offset += MIN(row_offset, output_shape_m) * (kShapeN / 8);
     }
     gmem_ptr = gmem_ptr_raw + offset;
   };
