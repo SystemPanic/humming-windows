@@ -1,8 +1,8 @@
 import pytest
 
 from humming import dtypes
-from humming.config import ComputeConfig, GemmType, LayerConfig, MmaType
-from humming.device import current_device
+from humming.config import ComputeConfig, GemmType, LayerConfig
+from humming.config.mma import get_default_mma_type
 from humming.testing import (
     KernelTestCase,
     KernelTestRunner,
@@ -41,7 +41,6 @@ def _case(
             input_scale_group_size=input_scale_group_size,
             weight_scale_group_size=weight_scale_group_size,
             has_bias=has_bias,
-            mma_type=MmaType.MMA if current_device.sm_version // 10 == 12 else None,
         ),
         compute_config=ComputeConfig(
             gemm_type=gemm_type,
@@ -63,6 +62,13 @@ F16_ACCUM_CASES = (
         a_dtype=dtypes.float16,
         b_dtype=dtypes.uint4,
         weight_scale_group_size=64,
+    ),
+    _case(
+        "fp16-group-scale-bias",
+        a_dtype=dtypes.float16,
+        b_dtype=dtypes.uint4,
+        weight_scale_group_size=64,
+        has_bias=True,
     ),
     _case(
         "fp16-bias-pad-nk",
@@ -112,7 +118,11 @@ def test_f16_accumulation(test_case):
     config = test_case.layer_config
     assert test_case.compute_config.use_f16_accum
     assert config.c_dtype == dtypes.float16
-    skip_if_unsupported(a_dtype=config.a_dtype, mma_type=config.mma_type.value)
+    if config.use_block_scaled_mma:
+        pytest.skip("block-scaled layers require FP32 accumulation")
+    if config.use_raw_weight and config.a_dtype.num_bits != config.b_dtype.num_bits:
+        pytest.skip("native mixed weight layout requires UMMA with FP32 accumulation")
+    skip_if_unsupported(a_dtype=config.a_dtype, mma_type=get_default_mma_type(config).value)
 
     runner = KernelTestRunner(test_case)
     results = runner.run()
@@ -125,6 +135,9 @@ def test_f16_accumulation_case_coverage():
     assert any(case.layer_config.has_bias for case in F16_ACCUM_CASES)
     assert any(case.layer_config.pad_shape_k for case in F16_ACCUM_CASES)
     assert any(case.layer_config.weight_scale_group_size for case in F16_ACCUM_CASES)
+    assert any(
+        case.layer_config.weight_scale_group_size and case.layer_config.has_bias for case in F16_ACCUM_CASES
+    )
     assert any(case.layer_config.input_scale_group_size for case in F16_ACCUM_CASES)
     assert not any(case.layer_config.use_fused_e8m0_scale for case in F16_ACCUM_CASES)
     assert any(case.compute_config.gemm_type == GemmType.GROUPED_CONTIGUOUS for case in F16_ACCUM_CASES)

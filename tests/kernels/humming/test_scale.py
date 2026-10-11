@@ -8,6 +8,8 @@ from humming.config import (
     WeightScale2Type,
     WeightScaleType,
 )
+from humming.config.mma import get_default_mma_type
+from humming.device import current_device
 from humming.testing import (
     KernelTestCase,
     KernelTestRunner,
@@ -36,6 +38,7 @@ GROUP_SCALE_DTYPES = (
     dtypes.bfloat16,
     dtypes.float8e4m3,
     dtypes.float8e5m2,
+    dtypes.float8e5m3,
     dtypes.float8e8m0,
 )
 
@@ -58,8 +61,6 @@ SECONDARY_SCALE_TYPES = (
 def _output_dtype(a_dtype, bs_dtype):
     if a_dtype.num_bits == 16:
         if bs_dtype.num_bits == 16 and bs_dtype != a_dtype:
-            return None
-        if a_dtype == dtypes.float16 and bs_dtype == dtypes.float8e8m0:
             return None
         return a_dtype
     if bs_dtype in (dtypes.float16, dtypes.bfloat16):
@@ -106,13 +107,108 @@ BS2_CASES = tuple(
 )
 
 SCALE_CASES = (
+    *(
+        _case(
+            f"mixed-e5m2-{b_dtype}-group{group_size}",
+            a_dtype=dtypes.float8e5m2,
+            b_dtype=b_dtype,
+            bs_dtype=dtypes.float8e8m0 if group_size == 32 else dtypes.bfloat16,
+            input_scale_group_size=group_size,
+            weight_scale_group_size=group_size,
+        )
+        for b_dtype in (dtypes.uint5, dtypes.float5e0m4, dtypes.float8e4m3)
+        for group_size in (32, 64)
+    ),
+    *(
+        _case(
+            f"e0m-group64-{a_dtype}-bs-{bs_dtype}",
+            a_dtype=a_dtype,
+            b_dtype=dtypes.float8e0m7,
+            c_dtype=a_dtype,
+            bs_dtype=bs_dtype,
+            weight_scale_group_size=64,
+        )
+        for a_dtype in (dtypes.float16, dtypes.bfloat16)
+        for bs_dtype in (a_dtype, dtypes.float8e8m0)
+    ),
+    _case(
+        "e0m-fp8-group32",
+        a_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.float5e0m4,
+        bs_dtype=dtypes.float8e8m0,
+        input_scale_group_size=32,
+        weight_scale_group_size=32,
+    ),
+    _case(
+        "e0m-fp4-group16",
+        a_dtype=dtypes.float4e2m1,
+        b_dtype=dtypes.float3e0m2,
+        bs_dtype=dtypes.float8e4m3,
+        input_scale_group_size=16,
+        weight_scale_group_size=16,
+    ),
     _case(
         "channel-bfloat16",
         a_dtype=dtypes.bfloat16,
         b_dtype=dtypes.uint4,
         bs_dtype=dtypes.bfloat16,
     ),
+    _case(
+        "channel-e8m0-bias",
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.uint4,
+        bs_dtype=dtypes.float8e8m0,
+        has_bias=True,
+    ),
+    _case(
+        "channel-e4m3-bias",
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.uint4,
+        bs_dtype=dtypes.float8e4m3,
+        has_bias=True,
+    ),
+    _case(
+        "secondary-channel-bias",
+        a_dtype=dtypes.float16,
+        c_dtype=dtypes.float16,
+        b_dtype=dtypes.uint4,
+        weight_scale_group_size=128,
+        weight_scale_2_type=WeightScale2Type.CHANNEL,
+        has_bias=True,
+    ),
+    _case(
+        "secondary-tensor-bias",
+        a_dtype=dtypes.bfloat16,
+        b_dtype=dtypes.uint4,
+        weight_scale_group_size=128,
+        weight_scale_2_type=WeightScale2Type.TENSOR,
+        has_bias=True,
+    ),
+    *(
+        _case(
+            f"channel-{a_dtype}-bs-{bs_dtype}",
+            a_dtype=a_dtype,
+            c_dtype=a_dtype,
+            b_dtype=dtypes.uint4,
+            bs_dtype=bs_dtype,
+        )
+        for a_dtype in (dtypes.float16, dtypes.bfloat16)
+        for bs_dtype in (dtypes.float8e4m3, dtypes.float8e5m2, dtypes.float8e5m3, dtypes.float8e8m0)
+    ),
     *BS_DTYPE_CASES,
+    *(
+        _case(
+            f"raw-fp8-group64-bs-{bs_dtype}",
+            a_dtype=dtypes.float8e4m3,
+            b_dtype=dtypes.float8e4m3,
+            bs_dtype=bs_dtype,
+            input_scale_group_size=64,
+            weight_scale_group_size=64,
+            use_int_weight_scale=False,
+            use_fused_e8m0_scale=False,
+        )
+        for bs_dtype in (dtypes.bfloat16, dtypes.float8e4m3)
+    ),
     _case(
         "tensor-float32",
         a_dtype=dtypes.bfloat16,
@@ -138,15 +234,43 @@ SCALE_CASES = (
         input_scale_group_size=64,
         weight_scale_group_size=64,
     ),
+    _case(
+        "fp8-input-group256-weight-group256",
+        a_dtype=dtypes.float8e4m3,
+        b_dtype=dtypes.uint4,
+        bs_dtype=dtypes.bfloat16,
+        input_scale_group_size=256,
+        weight_scale_group_size=256,
+        use_packed_k_layout=True,
+        sm_version=90,
+    ),
 )
 
 
 @pytest.mark.parametrize("test_case", SCALE_CASES, ids=str)
 def test_scale_config(test_case):
     config = test_case.layer_config
-    skip_if_unsupported(a_dtype=config.a_dtype, mma_type=config.mma_type.value)
+    skip_if_unsupported(a_dtype=config.a_dtype, mma_type=get_default_mma_type(config).value)
     results = KernelTestRunner(test_case).run()
     assert_kernel_test_shape_coverage(results)
+
+
+@pytest.mark.parametrize("sm_version", [80, 90, 100])
+@pytest.mark.parametrize("a_dtype", [dtypes.bfloat16, dtypes.float8e4m3, dtypes.int8])
+def test_group_scale_layout_is_independent_of_device(sm_version, a_dtype):
+    config = LayerConfig(
+        shape_n=1024,
+        shape_k=1024,
+        a_dtype=a_dtype,
+        b_dtype=dtypes.uint3,
+        c_dtype=dtypes.bfloat16,
+        bs_dtype=dtypes.bfloat16,
+        weight_scale_group_size=64,
+        use_int_weight_scale=False,
+        use_fused_e8m0_scale=False,
+        sm_version=sm_version,
+    )
+    assert config.should_apply_bs_on_c == (current_device.is_ppu and a_dtype.num_bits != 16)
 
 
 def test_scale_config_case_coverage():

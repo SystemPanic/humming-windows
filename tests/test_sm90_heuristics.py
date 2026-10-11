@@ -3,8 +3,10 @@ import math
 import pytest
 
 from humming import dtypes
-from humming.config import GemmType, LayerConfig, MmaType
+from humming.config import GemmType, LayerConfig, TuningConfig
+from humming.config.mma import get_register_budget_error
 from humming.device import DeviceInfo
+from humming.tune import _get_heuristics_config
 from humming.tune.sm90 import Sm90Heuristics
 
 
@@ -25,6 +27,7 @@ def _layer(
     weight_scale_group_size: int = 32,
 ) -> LayerConfig:
     return LayerConfig(
+        sm_version=90,
         shape_n=shape_n,
         shape_k=shape_k,
         num_experts=num_experts,
@@ -35,7 +38,6 @@ def _layer(
         bs_dtype=bs_dtype,
         input_scale_group_size=input_scale_group_size,
         weight_scale_group_size=weight_scale_group_size,
-        mma_type=MmaType.WGMMA,
     )
 
 
@@ -237,13 +239,13 @@ def test_dense_a16_requires_padding_when_n_has_no_wgmma_tile():
 def test_short_k_does_not_leave_warp_k_larger_than_block_k():
     config = Sm90Heuristics.get_config(
         LayerConfig(
+            sm_version=90,
             shape_n=128,
             shape_k=64,
             a_dtype=dtypes.int8,
             b_dtype=dtypes.uint7,
             c_dtype=dtypes.bfloat16,
             bs_dtype=dtypes.bfloat16,
-            mma_type=MmaType.WGMMA,
         ),
         shape_m=64,
         gemm_type=GemmType.DENSE,
@@ -365,3 +367,50 @@ def test_fp4_a16_dense_uses_small_tile_only_through_m128():
     assert small["warp_shape"][1:] == (32, 64)
     assert small["num_ctas_per_sm"] == 2
     assert large["block_shape"][1:] != (128, 64)
+
+
+@pytest.mark.parametrize("device_name", ["H200", "L20X"])
+@pytest.mark.parametrize("num_experts", [8, 33])
+@pytest.mark.parametrize("shape_n,shape_k", [(4096, 6144), (6144, 2048), (4096, 3072), (4096, 4096)])
+def test_grouped_w4a8_ranges_match_direct_selection(monkeypatch, device_name, num_experts, shape_n, shape_k):
+    monkeypatch.setattr("humming.tune.sm90_policies.torch.cuda.get_device_name", lambda: device_name)
+    monkeypatch.setattr("humming.tune.get_heuristics_class", lambda **kwargs: Sm90Heuristics)
+    layer = _layer(shape_n, shape_k, num_experts=num_experts)
+    assert layer.use_packed_k_layout
+    select = _get_heuristics_config.__wrapped__
+    kwargs = dict(use_m_major_input_scale=True, gemm_type=GemmType.GROUPED_CONTIGUOUS)
+    ranges = select(layer, **kwargs)
+    assert ranges[0][0] == 0 and ranges[-1][1] == 1 << 30
+    previous_upper = 0
+    for lower, upper, config in ranges:
+        assert lower == previous_upper and lower < upper
+        assert config["use_packed_k_layout"]
+        assert config["warp_shape"][1:] == (16, 128)
+        assert config["wgmma_use_late_as"]
+        assert config["wgmma_split_issue_wait"] == (config["warp_shape"][0] <= 160)
+        tuning_keys = ("mma_type", "block_shape", "warp_shape", "num_stages", "use_warp_spec")
+        tuning = TuningConfig(
+            **{key: config[key] for key in tuning_keys},
+            wgmma_split_issue_wait=config["wgmma_split_issue_wait"],
+        )
+        assert get_register_budget_error(layer, tuning, registers_per_sm=65536) is None
+        for shape_m in (lower + 1, min(upper, lower + num_experts * 2048)):
+            assert select(layer, shape_m=shape_m, **kwargs) == config
+        previous_upper = upper
+    for rows, tile in [
+        (128, 144),
+        (144, 160),
+        (160, 176),
+        (256, 144),
+        (288, 160),
+        (320, 176),
+        (512, 176),
+        (640, 176),
+    ]:
+        config = select(layer, shape_m=rows * num_experts, **kwargs)
+        expected_tile = tile if device_name == "H200" else 128
+        assert config["warp_shape"][0] == expected_tile
+        expected_stages = 4 if device_name == "H200" and (tile >= 160 or shape_k > 2048) else 5
+        assert config["num_stages"] == expected_stages
+    generic = select(layer, shape_m=4096, gemm_type=GemmType.GROUPED_CONTIGUOUS)
+    assert generic.get("raster_group_m", 1) == 1

@@ -16,6 +16,7 @@ from humming.config import (
     ProcessInputProblemConfig,
     ProcessInputTuningConfig,
 )
+from humming.config.mma import UNDOCUMENTED_FP_DTYPES, supports_undocumented_fp_dtypes
 from humming.device import DeviceInfo, get_device_index
 from humming.utils.math import ceil_div, is_pow_of_two, positive_divisors, powers_of_two_up_to, round_up
 
@@ -520,6 +521,9 @@ def _tuning_config_for_device(config: ProcessInputProblemConfig, shape_m: int, d
         raise ValueError(f"unsupported quant_dtype: {config.quant_dtype}")
     if minimum_sm is not None and device.sm_version < minimum_sm:
         raise RuntimeError(f"{config.quant_dtype} output requires SM{minimum_sm} or newer")
+    is_undocumented_fp_supported = supports_undocumented_fp_dtypes(device.sm_version)
+    if config.quant_dtype in UNDOCUMENTED_FP_DTYPES and not is_undocumented_fp_supported:
+        raise RuntimeError(f"{config.quant_dtype} output is not supported on SM{device.sm_version}")
 
     num_rows = max(shape_m, 1)
     tile_size = min(config.hidden_size & -config.hidden_size, 256)

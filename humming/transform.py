@@ -1,10 +1,13 @@
+import dataclasses
+
 import torch
 
 from humming import dtypes, ops
-from humming.config import LayerConfig, MmaType, WeightScale2Type, WeightScaleType
+from humming.config import LayerConfig, WeightScale2Type, WeightScaleType
 from humming.device import DeviceInfo, current_device
 from humming.schema import HummingInputSchema, HummingWeightSchema
 from humming.utils.math import round_up
+from humming.utils.weight import decode_e5m3_scale
 
 
 def prepare_layer_config(
@@ -85,7 +88,10 @@ def check_and_pad_tensors(config: LayerConfig, tensors: dict[str, torch.Tensor])
 
     if config.use_int_weight_scale:
         dtype = dtypes.torch_dtype_map[config.bs_dtype]
-        tensors["weight_scale"] = tensors["weight_scale"].to(dtype)
+        scale = tensors["weight_scale"]
+        if scale.dtype == torch.uint8:
+            scale = decode_e5m3_scale(scale)
+        tensors["weight_scale"] = scale.to(dtype)
 
     if config.use_int_weight_scale or config.use_fused_e8m0_scale:
         if (
@@ -242,7 +248,6 @@ def transform_humming_weight(
     b_dtype: dtypes.DataType,
     a_dtype: dtypes.DataType,
     zero_point: torch.Tensor | None = None,
-    use_wgmma: bool = False,
     use_fused_e8m0_scale: bool = False,
     packed: bool = False,
     padded_shape_n: int | None = None,
@@ -250,6 +255,7 @@ def transform_humming_weight(
     interleave_mode: int = 3,
     use_packed_k_layout: bool = False,
     use_native_dequant: bool = False,
+    use_raw_weight: bool = False,
 ) -> torch.Tensor:
     is_moe = weight.ndim == 3
     weight = weight.unsqueeze(0) if not is_moe else weight
@@ -269,6 +275,39 @@ def transform_humming_weight(
     assert padded_shape_n % 64 == 0
     assert padded_shape_k % (2 * packed_block_size_k) == 0
 
+    if a_dtype == dtypes.int8 and b_dtype in [dtypes.int8, dtypes.uint8]:
+        if not packed:
+            weight = ops.pack_weight(weight, b_dtype.num_bits)
+            packed = True
+        # Both TS and SS consume signed INT8 instead of offset-binary weight codes.
+        weight = (weight.view(torch.int8) - 128).view(torch.int32)
+
+    if a_dtype == dtypes.int4 and b_dtype in [dtypes.int4, dtypes.uint4]:
+        if not packed:
+            weight = ops.pack_weight(weight, b_dtype.num_bits)
+            packed = True
+        weight = weight.view(torch.uint8)
+        weight1 = (weight & 0xF) - 8
+        weight1 = weight1 & 0xF
+        weight2 = (weight & 0xF0) - 8 * 16
+        weight = (weight1 | weight2).view(torch.int32)
+
+    if use_raw_weight or a_dtype.num_bits == b_dtype.num_bits:
+        if a_dtype.num_bits == 8 and b_dtype.num_bits < 8:
+            padded_shape_k = round_up(padded_shape_k, 128)
+        # K-contiguous rows are consumed directly by the shared-memory MMA operand.
+        if not packed:
+            weight = ops.pack_weight(weight, b_dtype.num_bits)
+        weight = torch.nn.functional.pad(
+            weight, (0, (padded_shape_k - shape_k) * b_dtype.num_bits // 32, 0, padded_shape_n - shape_n)
+        )
+        if current_device.is_ppu:
+            # Match the even-then-odd channel order of PPU MMA's B operand.
+            weight = weight.view(-1, padded_shape_n // 8, 8, weight.size(-1))
+            weight = weight[:, :, [0, 2, 4, 6, 1, 3, 5, 7], :]
+            weight = weight.reshape(-1, padded_shape_n, weight.size(-1))
+        return weight if is_moe else weight.squeeze(0)
+
     should_preprocess_for_int2fp = False
     has_zero_point = zero_point is not None and zero_point.nelement() > 0
     if b_dtype.is_integer_type and a_dtype.is_floating_point_type:
@@ -278,16 +317,6 @@ def transform_humming_weight(
             should_preprocess_for_int2fp = b_dtype.num_bits > 6
         elif a_dtype == dtypes.bfloat16 and not has_zero_point:
             should_preprocess_for_int2fp = b_dtype.num_bits > 7
-
-    if a_dtype == dtypes.int8 and b_dtype in [dtypes.int8, dtypes.uint8]:
-        weight = (weight.view(torch.int8) - 128).view(torch.int32)
-
-    if a_dtype == dtypes.int4 and b_dtype in [dtypes.int4, dtypes.uint4]:
-        weight = weight.view(torch.uint8)
-        weight1 = (weight & 0xF) - 8
-        weight1 = weight1 & 0xF
-        weight2 = (weight & 0xF0) - 8 * 16
-        weight = (weight1 | weight2).view(torch.int32)
 
     if not should_preprocess_for_int2fp and has_zero_point:
         has_zero_point = False
@@ -304,10 +333,8 @@ def transform_humming_weight(
         group_size_zp = shape_k // zero_point.size(-1)
 
     if use_packed_k_layout:
-        assert use_wgmma, "use_packed_k_layout requires wgmma"
         assert a_dtype.num_bits == 8, "use_packed_k_layout requires 8-bit (fp8/int8) activation"
         assert b_dtype.num_bits % 2 == 0, "use_packed_k_layout requires even-bit weight"
-        assert not use_fused_e8m0_scale, "use_packed_k_layout is incompatible with fused-e8m0 scale"
 
     if current_device.is_ppu:
         ppu_perm = [0, 2, 4, 6, 1, 3, 5, 7]
@@ -330,7 +357,6 @@ def transform_humming_weight(
         is_weight_packed=packed,
         should_preprocess_for_int2fp=should_preprocess_for_int2fp,
         should_preprocess_with_zp=should_preprocess_with_zp,
-        use_wgmma=use_wgmma,
         interleave_mode=interleave_mode,
         use_fused_e8m0_scale=use_fused_e8m0_scale,
         group_size_zp=group_size_zp,
@@ -340,15 +366,78 @@ def transform_humming_weight(
     return repacked_weight if is_moe else repacked_weight.squeeze(0)
 
 
+def prepare_fp16_e8m0_scale(
+    config: LayerConfig, tensors: dict[str, torch.Tensor]
+) -> tuple[LayerConfig, dict[str, torch.Tensor]]:
+    """Extract a tensor scale only when E8M0 exceeds the padded E5M0 range."""
+    use_e5m0 = config.bs_dtype == dtypes.float8e8m0 and config.c_dtype == dtypes.float16
+    use_e5m0 &= not config.use_fused_e8m0_scale and not config.use_block_scaled_mma
+    if not use_e5m0 or config.is_tensor_weight_scale:
+        return config, tensors
+
+    scales = tensors["weight_scale"]
+    exponents = scales.view(torch.uint8).to(torch.int16).reshape(config.num_experts or 1, -1) - 127
+    valid_exponents = exponents
+    if config.pad_shape_n or config.pad_shape_k:
+        shape_n = config.shape_n - config.pad_shape_n
+        shape_k = config.shape_k - config.pad_shape_k
+        group_size = config.weight_scale_group_size or shape_k
+        num_groups = (shape_k + group_size - 1) // group_size
+        shaped_exponents = exponents.reshape(config.num_experts or 1, *scales.shape[-2:])
+        valid_exponents = shaped_exponents[:, :shape_n, :num_groups].flatten(1)
+    minimum = valid_exponents.amin(-1)
+    maximum = valid_exponents.amax(-1)
+    if bool(((minimum >= -14) & (maximum <= 15)).all()):
+        return config, tensors
+
+    # If both ends cannot fit, anchor the largest scale and underflow the low end.
+    lower_shift = maximum - 15
+    upper_shift = minimum + 14
+    shift = torch.where(maximum > 15, lower_shift, torch.maximum(upper_shift, lower_shift).clamp_max(0))
+    factor = torch.exp2(shift.float())
+    adjusted = (exponents - shift[:, None] + 127).clamp(112, 142).to(torch.uint8)
+    tensors = tensors.copy()
+    tensors["weight_scale"] = adjusted.reshape(scales.shape).view(scales.dtype)
+    secondary = tensors.get("weight_scale_2")
+    if config.is_channel_weight_scale_2:
+        assert secondary is not None
+        factor = factor.reshape(-1, 1) if config.num_experts else factor.reshape(())
+        tensors["weight_scale_2"] = (secondary.float() * factor).to(config.param_dtype)
+    else:
+        tensors["weight_scale_2"] = factor if secondary is None else secondary.float() * factor
+        config = dataclasses.replace(config, weight_scale_2_type=WeightScale2Type.TENSOR)
+    return config, tensors
+
+
+def pack_e8m0_scale_for_fp16(weight_scale: torch.Tensor) -> torch.Tensor:
+    """Rebias E8M0 to padded E5M0; saturate to 2^15 and flush values below 2^-14."""
+    exponent = weight_scale.view(torch.uint8).to(torch.int16) - (127 - 15)
+    return (exponent.clamp(0, 30) << 3).to(torch.uint8).view(weight_scale.dtype)
+
+
 def transform_humming_weight_scale(
     weight_scale: torch.Tensor,
     to_apply_on_c: bool = False,
     is_blockwise: bool = False,
     is_mxmma: bool = False,
     mxmma_scale_vec: int = 4,
+    is_umma: bool = False,
 ) -> torch.Tensor:
     if is_blockwise:
         return weight_scale.transpose(-1, -2).contiguous()
+
+    if is_umma:
+        # One copy tile holds 128 channels and four consecutive K scales.
+        scales = weight_scale.view(torch.uint8)
+        lead = scales.shape[:-2]
+        n, groups = scales.shape[-2:]
+        scales = torch.nn.functional.pad(scales, (0, -groups % 4, 0, -n % 128), value=127)
+        padded_n, padded_groups = scales.shape[-2:]
+        scales = scales.reshape(*lead, padded_n // 128, 4, 32, padded_groups // 4, 4)
+        ndim = len(lead)
+        order = (*range(ndim), ndim + 3, ndim, ndim + 2, ndim + 1, ndim + 4)
+        scales = scales.permute(*order).contiguous()
+        return scales.view(torch.int32).reshape(*lead, padded_groups // 4, padded_n)
 
     if is_mxmma:
         if mxmma_scale_vec == 1:
@@ -465,16 +554,21 @@ def transform_humming_tensors(
         b_dtype=config.b_dtype,
         a_dtype=config.a_dtype,
         zero_point=zero_point,
-        use_wgmma=config.mma_type == MmaType.WGMMA,
         use_fused_e8m0_scale=config.use_fused_e8m0_scale,
         packed=True,
         interleave_mode=interleave_mode,
         use_packed_k_layout=config.use_packed_k_layout,
         use_native_dequant=config.use_native_dequant,
+        use_raw_weight=config.use_raw_weight,
     )
 
+    if weight_scale is not None and config.bs_dtype == dtypes.float8e8m0:
+        uses_software_scale = not config.use_fused_e8m0_scale and not config.use_block_scaled_mma
+        if config.c_dtype == dtypes.float16 and uses_software_scale:
+            weight_scale = pack_e8m0_scale_for_fp16(weight_scale)
+
     if weight_scale is not None:
-        is_mxmma = config.mma_type == MmaType.MXMMA and (
+        is_mxmma = config.use_block_scaled_mma and (
             config.is_group_weight_scale or config.is_block_weight_scale
         )
         mxmma_scale_vec = None
@@ -487,16 +581,17 @@ def transform_humming_tensors(
             is_blockwise=config.weight_scale_type == WeightScaleType.BLOCK,
             is_mxmma=is_mxmma,
             mxmma_scale_vec=mxmma_scale_vec,
+            is_umma=is_mxmma and config.sm_version // 10 in (10, 11),
         )
 
     if zero_point is not None:
-        use_mxmma_zp_layout = (
-            config.mma_type == MmaType.MXMMA
+        use_grouped_fp4_zp_layout = (
+            config.use_block_scaled_mma
             and config.a_dtype.num_bits == 4
             and config.weight_scale_group_size > 0
         )
         num_groups_per_mma = 1
-        if use_mxmma_zp_layout:
+        if use_grouped_fp4_zp_layout:
             num_groups_per_mma = 256 // config.a_dtype.num_bits // config.weight_scale_group_size
         zero_point = transform_humming_zero_point(
             zero_point,

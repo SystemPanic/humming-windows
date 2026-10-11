@@ -231,9 +231,12 @@ Tensor launch_kernel_impl(
 
   CUlaunchAttribute attrs[2];
   uint32_t num_attrs = 0;
-  if (kernel_data.multi_cast_size_a * kernel_data.multi_cast_size_b > 1) {
+  uint32_t cluster_size = kernel_data.multi_cast_size_a * kernel_data.multi_cast_size_b * kernel_data.umma_cta_group_size;
+  config.gridDimX = (num_ctas / cluster_size) * cluster_size;
+  ASSERT_CHECK(config.gridDimX > 0, "not enough SMs for the requested CTA cluster");
+  if (cluster_size > 1) {
     attrs[num_attrs].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-    attrs[num_attrs].value.clusterDim.x = kernel_data.multi_cast_size_a * kernel_data.multi_cast_size_b;
+    attrs[num_attrs].value.clusterDim.x = cluster_size;
     attrs[num_attrs].value.clusterDim.y = 1;
     attrs[num_attrs].value.clusterDim.z = 1;
     num_attrs++;
@@ -288,6 +291,7 @@ std::tuple<int64_t, std::string> register_kernel(const std::string &cubin_path) 
       reader.getUint32("BLOCK_SHAPE_M"),
       reader.getUint32("BLOCK_SHAPE_N"),
       reader.getUint32("BLOCK_SHAPE_K"),
+      reader.getUint32("WARP_SHAPE_N"),
       reader.getUint32("PAD_SHAPE_N"),
       reader.getUint32("PAD_SHAPE_K"),
       reader.getUint32("NUM_EXPERTS"),
@@ -295,10 +299,12 @@ std::tuple<int64_t, std::string> register_kernel(const std::string &cubin_path) 
       reader.getUint32("WEIGHT_SCALE_GROUP_SIZE"),
       reader.getUint32("WEIGHT_SCALE_GROUP_SIZE_N"),
       reader.getUint32("NUM_CTAS_PER_SM"),
+      reader.getUint32("UMMA_CTA_GROUP_SIZE"),
+      reader.getUint32("OUTPUT_CHUNK_ROWS"),
       reader.getUint32("MULTI_CAST_SIZE_A"),
       reader.getUint32("MULTI_CAST_SIZE_B"),
       reader.getUint32("GEMM_TYPE_ID"),
-      reader.getUint32("MMA_TYPE_ID"),
+      static_cast<MmaType>(reader.getUint32("MMA_TYPE_ID")),
 
       reader.getBool("USE_STREAM_K"),
       reader.getBool("IS_FP_ZERO_POINT"),
@@ -324,14 +330,16 @@ std::tuple<int64_t, std::string> register_kernel(const std::string &cubin_path) 
       reader.getBool("USE_TMA_BZP"),
       reader.getBool("USE_TMA_BIAS"),
       reader.getBool("USE_PDL"),
-      reader.getBool("USE_PACKED_K_LAYOUT")};
+      reader.getBool("USE_PACKED_K_LAYOUT"),
+      reader.getBool("USE_UMMA_SS"),
+      reader.getBool("USE_RAW_WEIGHT"),
+      reader.getBool("USE_BLOCK_SCALED_MMA")};
 
   std::unique_lock lock(g_kernel_mutex);
   auto path_it = g_path_ids.find(cubin_path);
   if (path_it != g_path_ids.end()) return path_it->second;
 
-  int64_t hash_id = manual_crc32(cubin_path);
-  hash_id = (hash_id << 30) + manual_crc32(kernel_name);
+  int64_t hash_id = get_kernel_registration_id(cubin_path, kernel_name);
   auto kernel_it = g_registered_kernels.find(hash_id);
   bool no_collision = kernel_it == g_registered_kernels.end() || kernel_it->second.cubin_path == cubin_path;
   ASSERT_CHECK(no_collision, "kernel id collision for ", cubin_path);

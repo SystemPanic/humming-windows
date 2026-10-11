@@ -1,6 +1,7 @@
 #pragma once
 
 #include <humming/utils/all.cuh>
+#include <humming/utils/ptx/tcgen05.cuh>
 
 
 CUDA_INLINE void shlf_trans_mma_c_32b(void *vals_ptr) {
@@ -86,7 +87,7 @@ private:
   using ValTypeC = typename MmaOpClass::ValTypeC;
   using CRegistersArrayType = typename MMA::CRegistersArrayType;
 
-  static constexpr uint32_t kNumWriteSplits = Ctx::kNumWriteSplits;
+  static constexpr uint32_t kOutputRows = SharedStorage::kOutputRows;
   static constexpr uint32_t kNumMathThreads = Ctx::kNumMathThreads;
   static constexpr bool kHasInputScale = ElementA::kBits != 16;
   static constexpr bool kIsGroupInputScale = kHasInputScale && Ctx::kInputScaleGroupSize > 0;
@@ -95,7 +96,7 @@ private:
   static constexpr bool kUseIntWeightScale = Ctx::kUseIntWeightScale;
   static constexpr bool kUseFusedE8m0Scale = Ctx::kUseFusedE8m0Scale;
   static constexpr bool kHasGroupScale = kIsGroupInputScale || kIsGroupWeightScale || kIsBlockWeightScale;
-  static constexpr bool kIsIntAccum = std::is_same<ValTypeC, int32_t>::value && (!kHasGroupScale || kUseIntWeightScale || kUseFusedE8m0Scale);
+  static constexpr bool kIsIntAccum = std::is_same<ValTypeC, int32_t>::value && (!kHasGroupScale || kUseIntWeightScale || (kUseFusedE8m0Scale && !kIsGroupInputScale));
 
   static constexpr uint32_t M_WARPS = BlockShape::M / WarpShape::M;
   static constexpr uint32_t N_WARPS = BlockShape::N / WarpShape::N;
@@ -111,8 +112,8 @@ public:
   }
 
   CUDA_INLINE
-  void write(uint32_t *regs_ptr, uint32_t slice_count, uint32_t split_idx) {
-    if (threadIdx.x >= kNumMathThreads / K_WARPS) return;
+  void write(uint32_t *regs_ptr, uint32_t slice_count, uint32_t first_row) {
+    if (ctx.k_warp_id() != 0) return;
 
     auto &regs = *reinterpret_cast<CRegistersArrayType *>(regs_ptr);
     scalar_t2 *smem_half2_ptr = reinterpret_cast<scalar_t2 *>(ctx.smem.reduce);
@@ -129,12 +130,9 @@ public:
     auto write_to_smem = [&](PackTypeC val, uint32_t row_8x8block, uint32_t col_8x8block) {
       scalar_t2 val_half2;
 
-      static_assert(kNumWriteSplits == 1 || kNumWriteSplits == 2);
-      if constexpr (kNumWriteSplits == 2) {
-        static_assert(M_WARPS == 1);
-        uint32_t m_8x8block = kUseWgmma ? col_8x8block : row_8x8block;
-        if (split_idx == 0 && m_8x8block >= BlockShape::M / 8 / 2) return;
-        if (split_idx == 1 && m_8x8block < BlockShape::M / 8 / 2) return;
+      if constexpr (Ctx::kOutputChunkRows) {
+        uint32_t output_row = warp_delta_row + 8 * (kUseWgmma ? col_8x8block : row_8x8block);
+        if (output_row < first_row || output_row >= first_row + kOutputRows) return;
       }
 
       if constexpr (kUseWgmma) shlf_trans_mma_c(val);
@@ -168,29 +166,32 @@ public:
       uint32_t &val_uint = *reinterpret_cast<uint32_t *>(&val_half2);
       if constexpr (kUseWgmma) {
         arith.may_apply_on_smem_write(val_uint, col_8x8block, row_8x8block);
-        col_8x8block = col_8x8block - BlockShape::M / 8 / 2 * split_idx;
       } else {
         arith.may_apply_on_smem_write(val_uint, row_8x8block, col_8x8block);
-        row_8x8block = row_8x8block - BlockShape::M / 8 / 2 * split_idx;
       }
 
       if constexpr (!kUseWgmma) {
         uint32_t sub_row = laneid / 4;
-        uint32_t row = warp_delta_row + 8 * row_8x8block + sub_row;
+        uint32_t row = warp_delta_row + 8 * row_8x8block + sub_row - first_row;
         uint32_t col = col_8x8block * 4 + WarpShape::N / 2 * n_warp_id;
 
-        row = row + (BlockShape::M / kNumWriteSplits) * (col / 32);
+        row = row + kOutputRows * (col / 32);
         col = ((col % 32 / 4) ^ ((sub_row + smem) % 8)) * 4 + laneid % 4;
 
         uint32_t idx = row * 32 + col;
         smem_half2_ptr[idx] = val_half2;
       } else {
         uint32_t sub_row = (laneid % 4) * 2 + (laneid % 8) / 4;
-        uint32_t row = warp_delta_row + 8 * col_8x8block + sub_row;
+        uint32_t row = warp_delta_row + 8 * col_8x8block + sub_row - first_row;
 
-        uint32_t count = (64 / WarpShape::N);
-        uint32_t col1 = ((n_warp_id % count * (8 / count) + row_8x8block) ^ ((sub_row + smem) % 8)) * 4 + laneid / 8;
-        uint32_t col2 = (n_warp_id / count) * (BlockShape::M / kNumWriteSplits * 64 / 2);
+        uint32_t output_warp = n_warp_id;
+        if constexpr (Ctx::kUseWgmmaSsNLayout) {
+          output_warp = ctx.wgmma_ss_n_tile(row_8x8block / 2);
+          row_8x8block %= 2;
+        }
+        constexpr uint32_t count = Ctx::kUseWgmmaSsNLayout ? 4 : (64 / WarpShape::N);
+        uint32_t col1 = ((output_warp % count * (8 / count) + row_8x8block) ^ ((sub_row + smem) % 8)) * 4 + laneid / 8;
+        uint32_t col2 = (output_warp / count) * (kOutputRows * 64 / 2);
         uint32_t idx = row * 32 + col1 + col2;
         smem_half2_ptr[idx] = val_half2;
       }
@@ -213,6 +214,143 @@ public:
             write_to_smem(part_regs[n * inner_m + m], row_index, col_index);
           }
         }
+      }
+    }
+  }
+
+  template <class WriteChunk>
+  CUDA_INLINE void write_umma(MMA &mma, uint32_t slice_id, uint32_t slice_count, WriteChunk write_chunk) {
+    // Overlapped accumulators can emit other rows before row zero. Prepare
+    // channel scales before either output order reads them.
+    arith.may_process_on_smem_write(0, 0);
+    // Specialize both output orders so scale-array indices stay compile-time constants.
+    if constexpr (MMA::kAccumulatorStride != 0 && MMA::kAccumulatorStride < WarpShape::M) {
+      if (mma.output_chunk_index(0) != 0) write_umma_order<true>(mma, slice_id, slice_count, write_chunk);
+      else write_umma_order<false>(mma, slice_id, slice_count, write_chunk);
+    } else write_umma_order<false>(mma, slice_id, slice_count, write_chunk);
+  }
+
+  template <bool kRotate, class WriteChunk>
+  CUDA_INLINE void write_umma_order(MMA &mma, uint32_t slice_id, uint32_t slice_count, WriteChunk write_chunk) {
+    constexpr bool kChunked = Ctx::kOutputChunkRows != 0;
+    constexpr uint32_t kStorageRows = kOutputRows;
+    uint32_t lane = ctx.lane_id();
+    uint32_t warp = ctx.math_thread_id() / 32;
+    uint32_t n_partition = ctx.math_group;
+    uint32_t column = n_partition * 128 + warp * 32 + (lane / 8) * 8;
+    uint32_t row_in_matrix = Ctx::kUmmaCtaGroupSize == 2 ? lane % 8 : (lane % 8) / 2 + (lane % 2) * 4;
+    uint32_t smem_base = offsetof(SharedStorage, reduce) / 128 % 8;
+    uint32_t output_base = cast_smem_ptr_to_uint(ctx.smem.reduce);
+    uint32_t chunk_step = 0;
+
+    PRAGMA_UNROLL
+    for (uint32_t step = 0; step < CEIL_DIV(WarpShape::M, 32); step++) {
+      uint32_t m = kRotate ? (step + MMA::kAccumulatorStride / 32) % CEIL_DIV(WarpShape::M, 32) : step;
+      uint32_t lower[16];
+      uint32_t upper[16];
+      uint32_t rows = MIN(32, WarpShape::M - m * 32);
+      mma.load_output_chunk(m, rows, lower, upper);
+      if constexpr (kChunked && (!Ctx::kIsIndexedGemm || MMA::kCanOverlapAccumulators)) {
+        if (step + 1 == MMA::kAccumulatorReleaseChunks && ctx.math_group + 1 == MMA::kOutputGroups) {
+          tcgen05_fence_before_thread_sync();
+          ctx.sync_math_threads();
+          if (ctx.math_thread_id() == 0) {
+            if constexpr (Ctx::kUmmaCtaGroupSize == 2)
+              mbarrier_arrive<true>(__cluster_map_shared_rank(&ctx.smem.umma_accumulator_free, 0));
+            else mbarrier_arrive(&ctx.smem.umma_accumulator_free);
+          }
+        }
+      }
+      PRAGMA_UNROLL
+      for (uint32_t group = 0; group < rows / 8; group++) {
+        uint32_t first_row = m * 32 + group * 8;
+        uint32_t local_row = kChunked ? first_row % kStorageRows : first_row;
+        uint32_t buffer_offset = 0;
+        if constexpr (kChunked) {
+          buffer_offset = ((chunk_step + output_chunk_phase) % 2) * kStorageRows * BlockShape::N;
+          if (local_row == 0) {
+            if constexpr (Ctx::kUseTmaC) tma_wait_store_group<1, true>();
+            ctx.sync_math_threads();
+          }
+        }
+        uint32_t values[4];
+        // TMEM holds N in rows and M in columns. stmatrix writes four 8-column
+        // matrices from the two 16-row TMEM loads.
+        if constexpr (Ctx::kUmmaCtaGroupSize == 2) {
+          values[0] = convert_umma_pair(lower[group * 4], lower[group * 4 + 1], m * 4 + group, 0);
+          values[1] = convert_umma_pair(lower[group * 4 + 2], lower[group * 4 + 3], m * 4 + group, 1);
+          values[2] = convert_umma_pair(upper[group * 4], upper[group * 4 + 1], m * 4 + group, 2);
+          values[3] = convert_umma_pair(upper[group * 4 + 2], upper[group * 4 + 3], m * 4 + group, 3);
+        } else {
+          values[0] = convert_umma_pair(lower[group * 4], lower[group * 4 + 2], m * 4 + group, 0);
+          values[1] = convert_umma_pair(lower[group * 4 + 1], lower[group * 4 + 3], m * 4 + group, 1);
+          values[2] = convert_umma_pair(upper[group * 4], upper[group * 4 + 2], m * 4 + group, 2);
+          values[3] = convert_umma_pair(upper[group * 4 + 1], upper[group * 4 + 3], m * 4 + group, 3);
+        }
+        uint32_t row = local_row + row_in_matrix;
+        uint32_t swizzled_column = ((column % 64 / 8) ^ ((row + smem_base) % 8)) * 8;
+        uint32_t output_offset = buffer_offset + (row + kStorageRows * (column / 64)) * 64 + swizzled_column;
+        st_shared<4, true>(output_base + output_offset * 2, values);
+        if constexpr (kChunked) {
+          if (local_row + 8 == kStorageRows || first_row + 8 == WarpShape::M) {
+            uint32_t chunk_first_row = first_row - local_row;
+            uint32_t chunk_rows = local_row + 8;
+            if constexpr (ArithClass::kNeedsPackedOutputTransform)
+              apply_umma_packed_output_arithmetic(chunk_first_row, chunk_rows, buffer_offset / 8, kStorageRows);
+            if constexpr (Ctx::kUseTmaC) tma_fence_async_shared();
+            ctx.sync_math_threads();
+            write_chunk(chunk_first_row, chunk_rows, buffer_offset / 8);
+            if constexpr (!Ctx::kUseTmaC) ctx.sync_math_threads();
+            chunk_step++;
+          }
+        }
+      }
+    }
+    // Publish all partial sums before another slice acquires the output lock.
+    if constexpr (kChunked && Ctx::kUseTmaC && Ctx::kUseStreamK) {
+      if (slice_count > 1 && slice_id != slice_count - 1) tma_wait_store_group<0>();
+    }
+    if constexpr (kChunked) output_chunk_phase ^= CEIL_DIV(WarpShape::M, kStorageRows) % 2;
+    else if constexpr (ArithClass::kNeedsPackedOutputTransform) {
+      apply_umma_packed_output_arithmetic();
+    }
+  }
+
+private:
+  uint32_t output_chunk_phase = 0;
+
+  CUDA_INLINE uint32_t convert_umma_pair(uint32_t first, uint32_t second, uint32_t row_group, uint32_t column_group) {
+    float first_value = __uint_as_float(first);
+    float second_value = __uint_as_float(second);
+    if constexpr (kIsIntAccum) {
+      first_value = float(int32_t(first));
+      second_value = float(int32_t(second));
+    }
+    arith.apply_native_f32_output_scale(first_value, second_value, row_group, column_group);
+    float2 values = {first_value, second_value};
+    auto packed = this->float22num2(values);
+    return *reinterpret_cast<uint32_t *>(&packed);
+  }
+
+  CUDA_INLINE void apply_umma_packed_output_arithmetic(uint32_t first_row = 0, uint32_t rows = WarpShape::M,
+                                                       uint32_t buffer_offset = 0, uint32_t storage_rows = BlockShape::M) {
+    uint32_t n_partition = ctx.math_group;
+    uint32_t warp = ctx.math_thread_id() / 32;
+    uint32_t lane = ctx.lane_id();
+    uint32_t smem_base = offsetof(SharedStorage, reduce) / 128 % 8;
+
+    __syncwarp();
+    for (uint32_t row = lane / 4; row < rows; row += 8) {
+      PRAGMA_UNROLL
+      for (uint32_t pair = 0; pair < 4; pair++) {
+        // Visit stmatrix's transposed groups in the channel loader's register order.
+        uint32_t column = n_partition * 128 + warp * 32 + pair * 8;
+        uint32_t swizzled_chunk = (column % 64 / 8) ^ ((row + smem_base) % 8);
+        uint32_t offset = buffer_offset + (row + storage_rows * (column / 64)) * 8 + swizzled_chunk;
+        uint32_t *pairs = reinterpret_cast<uint32_t *>(&ctx.smem.reduce[offset]);
+        uint32_t value = pairs[lane % 4];
+        arith.may_apply_on_smem_write(value, (first_row + row) / 8, pair);
+        pairs[lane % 4] = value;
       }
     }
   }

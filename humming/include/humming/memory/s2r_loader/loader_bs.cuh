@@ -32,7 +32,7 @@ public:
   CUDA_INLINE
   void load_sf(const int4 *smem_ptr, uint32_t *regs_ptr, int32_t iter_id) {
     const uint32_t *smem_ptr_load = reinterpret_cast<const uint32_t *>(smem_ptr);
-    uint32_t warp_id = threadIdx.x / 32;
+    uint32_t warp_id = ctx.warp_id();
     uint32_t lane_id = threadIdx.x % 32;
 
     uint32_t col_in_tile = lane_id / 4;
@@ -65,8 +65,14 @@ public:
 
   CUDA_INLINE
   void load(const int4 *smem_ptr, uint32_t *regs_ptr, int32_t iter_id) {
-    if constexpr (kIsBlock) {
+    if constexpr (Ctx::kUseWgmmaSsNLayout && !kIsBlock) {
+      load_wgmma_ss(smem_ptr, regs_ptr, iter_id);
+    } else if constexpr (Ctx::kUsePackedKLayout && kUseFusedE8m0Scale) {
+      load_packed_k(smem_ptr, regs_ptr, iter_id);
+    } else if constexpr (kIsBlock) {
       load_block(smem_ptr, regs_ptr, iter_id);
+    } else if constexpr (Ctx::kUseMmaGroupScaleLayout1) {
+      load_mma_layout1(smem_ptr, regs_ptr, iter_id);
     } else if constexpr (!kUseFusedE8m0Scale && (kIsChannel || (!kUseWgmma && ElementA::kBits != 16))) {
       load_layout2(smem_ptr, regs_ptr, iter_id);
     } else {
@@ -75,9 +81,57 @@ public:
   }
 
   CUDA_INLINE
+  void load_wgmma_ss(const int4 *smem_ptr, uint32_t *regs_ptr, int32_t iter_id) {
+    constexpr uint32_t kScalesPerFragment = kIsChannel ? 4 : 2;
+    using LoadType = typename LoadTypeChooser<kScalesPerFragment * ElementBS::kBits / 8>::Type;
+    const LoadType *source = reinterpret_cast<const LoadType *>(smem_ptr);
+    LoadType *destination = reinterpret_cast<LoadType *>(regs_ptr);
+    PRAGMA_UNROLL
+    for (uint32_t j = 0; j < WarpShape::N / 16; ++j) {
+      uint32_t tile = ctx.wgmma_ss_n_tile(j);
+      uint32_t offset;
+      if constexpr (kIsChannel)
+        offset = tile / 2 * 8 + ctx.lane_id() / 8 * 2 + tile % 2;
+      else
+        offset = tile / 4 * 32 + ctx.lane_id() / 4 * 4 + tile % 4;
+      if constexpr (!kIsChannel && kGroupSize < BlockShape::K)
+        offset += (ctx.k_warp_offset() + iter_id * kPartMmaShapeK) / kGroupSize * BlockShape::N / kScalesPerFragment;
+      destination[j] = source[offset];
+    }
+  }
+
+  CUDA_INLINE
+  void load_packed_k(const int4 *smem_ptr, uint32_t *regs_ptr, uint32_t iter_id) {
+    static_assert(kUseWgmma && ElementBS::kBits == 8);
+    static_assert(kGroupSize >= kPartMmaShapeK);
+    static_assert(WarpShape::K % (2 * kPartMmaShapeK) == 0);
+    constexpr uint32_t kNumKSlabs = WarpShape::K / kPartMmaShapeK;
+    const uint32_t n_tile = ctx.n_warp_offset() / 16 + iter_id;
+    // Layout1 packs the two N8 scale rows used by an N16 RS fragment.
+    const uint32_t n_index = ctx.lane_id() / 4 * 4 + n_tile % 4 + n_tile / 4 * 32;
+    const uint16_t *scales = reinterpret_cast<const uint16_t *>(smem_ptr);
+    PRAGMA_UNROLL
+    for (uint32_t slab = 0; slab < kNumKSlabs; slab += 2) {
+      const uint32_t k_base = ctx.k_warp_offset() + slab * kPartMmaShapeK;
+      const uint32_t group0 = k_base / kGroupSize;
+      const uint32_t group1 = (k_base + kPartMmaShapeK) / kGroupSize;
+      regs_ptr[slab / 2] = scales[group0 * BlockShape::N / 2 + n_index] |
+                           (uint32_t(scales[group1 * BlockShape::N / 2 + n_index]) << 16);
+    }
+  }
+
+  CUDA_INLINE
   void load_block(const int4 *smem_ptr, uint32_t *regs_ptr, int32_t iter_id) {
     static_assert(kGroupSizeN >= 64);
 
+    if constexpr (Ctx::kUseWgmmaSsNLayout) {
+      uint32_t group = (ctx.k_warp_offset() + iter_id * kPartMmaShapeK) / kGroupSize;
+      const uint32_t *source = reinterpret_cast<const uint32_t *>(smem_ptr);
+      PRAGMA_UNROLL
+      for (uint32_t j = 0; j < WarpShape::N / 16; ++j)
+        regs_ptr[j] = source[group * CEIL_DIV(BlockShape::N, kGroupSizeN) + ctx.wgmma_ss_n_tile(j) * 16 / kGroupSizeN];
+      return;
+    }
     uint32_t index = ctx.n_warp_offset() / kGroupSizeN;
     if constexpr (BlockShape::K >= kGroupSize) {
       uint32_t k_index = ctx.k_warp_offset() + iter_id * kPartMmaShapeK;
@@ -86,6 +140,35 @@ public:
     }
     regs_ptr[0] = reinterpret_cast<const uint32_t *>(smem_ptr)[index];
   };
+
+  CUDA_INLINE
+  void load_mma_layout1(const int4 *smem_ptr, uint32_t *regs_ptr, int32_t iter_id) {
+    static_assert(BlockShape::N >= 64);
+    constexpr uint32_t kScalesPerParity = WarpShape::N / 8;
+    constexpr uint32_t kBytesPerParity = kScalesPerParity * ElementBS::kBits / 8;
+    using LoadType = typename LoadTypeChooser<kBytesPerParity>::Type;
+    constexpr uint32_t kLoadsPerParity = kBytesPerParity / sizeof(LoadType);
+
+    uint32_t n_base = ctx.n_warp_offset();
+    uint32_t offset = n_base / 64 * 64 + ctx.lane_id() % 4 * 16 + n_base % 64 / 8;
+    if constexpr (kGroupSize < BlockShape::K) {
+      uint32_t k_index = ctx.k_warp_offset() + iter_id * kPartMmaShapeK;
+      offset += k_index / kGroupSize * BlockShape::N;
+    }
+    const uint8_t *scales = reinterpret_cast<const uint8_t *>(smem_ptr);
+    LoadType *destination = reinterpret_cast<LoadType *>(regs_ptr);
+
+    // Keep even and odd N channels in separate register sequences. Conversion
+    // preserves this order; accumulator updates select the corresponding scale.
+    PRAGMA_UNROLL
+    for (uint32_t parity = 0; parity < 2; ++parity) {
+      const LoadType *source = reinterpret_cast<const LoadType *>(scales + (offset + parity * 8) * ElementBS::kBits / 8);
+      PRAGMA_UNROLL
+      for (uint32_t i = 0; i < kLoadsPerParity; ++i) {
+        destination[parity * kLoadsPerParity + i] = source[i];
+      }
+    }
+  }
 
   CUDA_INLINE
   void load_layout1(const int4 *smem_ptr, uint32_t *regs_ptr, int32_t iter_id) {

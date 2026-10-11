@@ -20,7 +20,7 @@ private:
 
   static constexpr bool kIsGroupedGemm = Ctx::kIsGroupedGemm;
   static constexpr bool kHasTensorInputScale = Ctx::kIsTensorInputScale || Ctx::kIsTensorInputScale2;
-  static constexpr uint32_t kNumWriteSplits = Ctx::kNumWriteSplits;
+  static constexpr uint32_t kOutputRows = SharedStorage::kOutputRows;
 
 public:
   Ctx &ctx;
@@ -39,7 +39,7 @@ public:
       : ctx(ctx), locks(ctx.params.locks), arith(arith),
         smem_reducer(ctx), smem_writer(ctx, arith), gmem_writer(ctx, arith) {
     if constexpr (Ctx::kUseTmaC) {
-      if constexpr (kIsGroupedGemm) {
+      if constexpr (SharedStorage::kUseDynamicOutputMap) {
         gmem_writer.update_tensor_map_ptr(ctx.params.tensor_map_buffer + blockIdx.x);
       } else if constexpr (!Ctx::kUseWarpSpec) {
         if (threadIdx.x == 0) prefetch_tensor_map(ctx.params.c);
@@ -50,25 +50,30 @@ public:
 
   CUDA_INLINE
   void call(uint32_t *regs_c_ptr) {
+    // Issuing threads drain the previous tile before any math thread reuses its output storage.
+    if constexpr (Ctx::kUseWarpSpec && Ctx::kUseTmaC && Ctx::kSmemReuseMode == SmemReuseMode::NONE)
+      tma_wait_store_group<0, true>();
     ctx.sync_math_threads();
     if constexpr (BlockShape::K > WarpShape::K) smem_reducer.reduce(regs_c_ptr);
-    static_assert(kNumWriteSplits == 1 || kNumWriteSplits == 2);
-    if constexpr (kNumWriteSplits > 1) {
-      static_assert(BlockShape::M == WarpShape::M);
-      static_assert(BlockShape::M % 32 == 0);
-      static_assert(!Ctx::kUseTmaC);
-    }
-
     if (slice_count > 1) acquire_gmem_barrier();
     PRAGMA_UNROLL
-    for (uint32_t i = 0; i < kNumWriteSplits; i++) {
-      smem_writer.write(regs_c_ptr, slice_count, i);
+    for (uint32_t first_row = 0; first_row < BlockShape::M; first_row += kOutputRows) {
+      smem_writer.write(regs_c_ptr, slice_count, first_row);
       if constexpr (Ctx::kUseTmaC) {
         if (ctx.is_math_thread()) tma_fence_async_shared();
       }
       ctx.sync_math_threads();
-      gmem_writer.write(slice_id, slice_count, i);
+      if constexpr (Ctx::kOutputChunkRows) {
+        gmem_writer.write_chunk(slice_id, slice_count, first_row, MIN(kOutputRows, BlockShape::M - first_row), 0);
+        // This path reuses one buffer. Wait before the next chunk overwrites it.
+        if constexpr (Ctx::kUseTmaC) tma_wait_store_group<0, true>();
+      } else {
+        gmem_writer.write(slice_id, slice_count, 0);
+      }
       ctx.sync_math_threads();
+    }
+    if constexpr (Ctx::kOutputChunkRows && Ctx::kUseTmaC && Ctx::kUseStreamK) {
+      if (slice_count > 1 && slice_id != slice_count - 1) tma_wait_store_group<0>();
     }
     if (slice_count > 1) release_gmem_barrier();
   }
@@ -77,9 +82,9 @@ public:
   void acquire_gmem_barrier() {
     if (Ctx::kUseTmaC || slice_count > 3) {
       int32_t val = slice_id == 0 ? 0 : -1;
-      barrier_acquire2<Ctx::kNumMathThreads, Ctx::kNumThreads>(&locks[locks_offset], val);
+      barrier_acquire2<Ctx::kNumMathThreads, Ctx::kNumThreads>(&locks[locks_offset], val, ctx.math_thread_id());
     } else {
-      barrier_acquire<Ctx::kNumMathThreads, Ctx::kNumThreads>(&locks[locks_offset], slice_id);
+      barrier_acquire<Ctx::kNumMathThreads, Ctx::kNumThreads>(&locks[locks_offset], slice_id, ctx.math_thread_id());
     }
   }
 
@@ -87,16 +92,41 @@ public:
   void release_gmem_barrier() {
     if (Ctx::kUseTmaC || slice_count > 3) {
       int32_t val = slice_id == 0 ? 1 - static_cast<int32_t>(slice_count) : 0;
-      barrier_release2<Ctx::kNumMathThreads, Ctx::kNumThreads>(&locks[locks_offset], val);
+      barrier_release2<Ctx::kNumMathThreads, Ctx::kNumThreads>(&locks[locks_offset], val, ctx.math_thread_id());
     } else {
-      barrier_release<Ctx::kNumMathThreads, Ctx::kNumThreads>(&locks[locks_offset], slice_id == slice_count - 1);
+      barrier_release<Ctx::kNumMathThreads, Ctx::kNumThreads>(&locks[locks_offset], slice_id == slice_count - 1, ctx.math_thread_id());
+    }
+  }
+
+  // Load directly into epilogue registers while UMMA is still accumulating. Indexed
+  // rows come from the immutable routing table, not the next tile's shared indices.
+  CUDA_INLINE
+  void load_secondary_input_scale(uint32_t m_block_id, uint32_t current_shape_m, uint32_t m_offset) {
+    if constexpr (Ctx::kHasInputScale2) {
+      const uint32_t *scales = reinterpret_cast<const uint32_t *>(ctx.params.as2);
+      if constexpr (Ctx::kIsTensorInputScale2) {
+        arith.as[0] = scales[0];
+      } else {
+        PRAGMA_UNROLL
+        for (uint32_t i = 0; i < WarpShape::M / 8; i++) {
+          uint32_t row = i * 8 + ctx.lane_id() / 4;
+          if constexpr (Ctx::kIsIndexedGemm) {
+            row = ctx.params.sorted_ids_ptr[m_block_id * BlockShape::M + row] / ctx.params.top_k;
+          } else if constexpr (kIsGroupedGemm) {
+            row += m_offset;
+          } else {
+            row += m_block_id * BlockShape::M;
+          }
+          arith.as[i] = row < current_shape_m ? scales[row] : __float_as_uint(1.0f);
+        }
+      }
     }
   }
 
   CUDA_INLINE
   void seek(uint32_t expert_id, uint32_t m_block_id, uint32_t n_block_id, uint32_t current_shape_m, uint32_t m_offset) {
     gmem_writer.seek(m_block_id, n_block_id, current_shape_m, m_offset);
-    if constexpr (kHasTensorInputScale) {
+    if constexpr (kHasTensorInputScale && !(Ctx::kUseUmma && Ctx::kHasInputScale2)) {
       const uint32_t *as_ptr = reinterpret_cast<const uint32_t *>(Ctx::kIsTensorInputScale2 ? ctx.params.as2 : ctx.params.as);
       arith.as[0] = as_ptr[0];
     }

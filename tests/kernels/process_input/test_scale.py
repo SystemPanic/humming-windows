@@ -10,12 +10,14 @@ from humming.testing.process_input import (
 )
 
 
-@pytest.mark.parametrize("quant_dtype", ["int8", "float8e4m3"])
+@pytest.mark.parametrize("use_pdl", [False, True])
+@pytest.mark.parametrize("quant_dtype", ["int4", "int8", "float8e4m3"])
 @pytest.mark.parametrize(
     "shape_m,hidden_size,quant_group_size,quant_mode,group_scale_dtype,use_m_major_input_scale",
     [
         (3, 768, 128, "static_tensor", "float32", False),
         (129, 32768, 512, "dynamic_token", "float32", False),
+        (2049, 768, 128, "dynamic_token", "float32", False),
         (129, 32768, 512, "dynamic_token", "float32", True),
         (3, 768, 128, "dynamic_token", "float32", True),
         (4, 7168, 128, "dynamic_group", "float32", False),
@@ -39,6 +41,7 @@ def test_quantization_scales(
     quant_mode,
     group_scale_dtype,
     use_m_major_input_scale,
+    use_pdl,
 ):
     skip_if_process_input_unsupported(quant_dtype, group_scale_dtype)
     torch.manual_seed(0)
@@ -66,7 +69,7 @@ def test_quantization_scales(
     )
 
     expected = process_input_ref(inputs, static_tensor_scale=static_tensor_scale, **options)
-    actual = process_input(inputs, token_scales=static_tensor_scale, **options)
+    actual = process_input(inputs, token_scales=static_tensor_scale, use_pdl=use_pdl, **options)
 
     assert_process_input_close(
         actual,
@@ -77,3 +80,27 @@ def test_quantization_scales(
         quant_group_size=quant_group_size,
         use_m_major_input_scale=use_m_major_input_scale,
     )
+
+
+def test_group_token_scales_with_cold_inputs():
+    """Launch on inputs no earlier launch has read, so warps reach the fused reductions at uneven times."""
+    options = dict(
+        quant_mode="dynamic_group_token",
+        quant_dtype="int8",
+        quant_group_size=128,
+        group_scale_dtype="float8e4m3",
+    )
+    skip_if_process_input_unsupported(options["quant_dtype"], options["group_scale_dtype"])
+    torch.manual_seed(0)
+
+    # Each launch reads the first rows of its own 8 MiB region.
+    shape_m, hidden_size, num_launches = 28, 1024, 16
+    input_pool = torch.randn(num_launches, 2048, hidden_size, device="cuda")
+
+    for launch_inputs in input_pool:
+        inputs = launch_inputs[:shape_m]
+        # The reference would warm the cache, so the kernel must read the slice first.
+        actual = process_input(inputs, **options)
+        expected = process_input_ref(inputs, **options)
+
+        assert_process_input_close(actual, expected, **options)

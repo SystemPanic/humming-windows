@@ -1,12 +1,15 @@
 import functools
+import math
+import os
 
 import torch
 
-from humming.config import GemmType, LayerConfig
+from humming.config import GemmType, LayerConfig, MmaType
+from humming.config.mma import get_default_mma_type
 from humming.device import DeviceInfo, get_device_index
 from humming.tune.base import DeviceHeuristics
-from humming.tune.raster import raster_group_m_for_config
 from humming.tune.ppu_sm80 import PPUSm80Heuristics
+from humming.tune.raster import raster_group_m_for_config
 from humming.tune.sm8x import (
     Sm80Heuristics,
     Sm86Heuristics,
@@ -16,6 +19,11 @@ from humming.tune.sm8x import (
 from humming.tune.sm75 import Sm75Heuristics
 from humming.tune.sm90 import Sm90Heuristics
 from humming.tune.sm90_h20 import Sm90H20Heuristics
+from humming.tune.sm90_policies import (
+    apply_indexed_w4a8_config,
+    apply_w4a8_config,
+    specialize_w4a8_ranges,
+)
 from humming.tune.sm100 import Sm100Heuristics
 from humming.tune.sm120 import Sm120Heuristics
 from humming.tune.sm121 import Sm121Heuristics
@@ -55,16 +63,26 @@ def get_heuristics_class(device: int | torch.device | None = None) -> type[Devic
     return heuristics_map[sm_version_base]
 
 
-def _apply_m_major_input_scale(
+def _can_load_row_major_input_scale_with_tma(config: dict, layer_config: LayerConfig) -> bool:
+    if config.get("mma_type") != MmaType.UMMA.value or not layer_config.is_group_input_scale:
+        return False
+    scale_words = 4 * layer_config.input_scale_group_size
+    block_k = config["block_shape"][2]
+    row_words = math.ceil((layer_config.shape_k - layer_config.pad_shape_k) / scale_words)
+    return block_k % scale_words == 0 and row_words % 4 == 0
+
+
+def _apply_input_scale_tma(
     config: dict,
     use_m_major_input_scale: bool,
     layer_config: LayerConfig,
     gemm_type: GemmType,
 ) -> None:
-    if not use_m_major_input_scale:
-        return
     use_tma = config.get("use_tma", False)
-    if use_tma and layer_config.input_scale_group_size > 0 and gemm_type != GemmType.INDEXED:
+    if not use_tma or layer_config.input_scale_group_size == 0 or gemm_type == GemmType.INDEXED:
+        return
+    can_use_tma = use_m_major_input_scale or _can_load_row_major_input_scale_with_tma(config, layer_config)
+    if can_use_tma:
         config["use_tma_as"] = True
 
 
@@ -98,11 +116,19 @@ def _get_heuristics_config(
     use_f16_accum: bool = False,
     use_batch_invariant: bool = False,
     use_m_major_input_scale: bool = False,
-    gemm_type: str | GemmType = "dense",
+    gemm_type: str | GemmType | None = "dense",
     device_index: int = 0,
+    is_heuristic_test: bool = False,
 ):
+    if gemm_type is None:
+        if layer_config.num_experts:
+            raise ValueError("gemm_type must be specified for MoE GEMM")
+        gemm_type = GemmType.DENSE
     if isinstance(gemm_type, str):
         gemm_type = GemmType(gemm_type)
+
+    if use_f16_accum and layer_config.use_block_scaled_mma:
+        raise ValueError("block-scaled layers require FP32 accumulation")
 
     heuristics_cls = get_heuristics_class(device=device_index)
     if isinstance(shape_m, int):
@@ -112,10 +138,14 @@ def _get_heuristics_config(
             use_f16_accum=use_f16_accum,
             use_batch_invariant=use_batch_invariant,
             gemm_type=gemm_type,
+            use_m_major_input_scale=use_m_major_input_scale,
         )
-        _apply_m_major_input_scale(config, use_m_major_input_scale, layer_config, gemm_type)
+        config.setdefault("mma_type", get_default_mma_type(layer_config).value)
+        _apply_input_scale_tma(config, use_m_major_input_scale, layer_config, gemm_type)
         _disable_indexed_input_scale_tma(config, gemm_type)
         _apply_raster_group_m(config, layer_config, gemm_type)
+        apply_w4a8_config(config, layer_config, use_m_major_input_scale, gemm_type, shape_m)
+        apply_indexed_w4a8_config(config, layer_config, gemm_type)
         return config
     else:
         configs = heuristics_cls.get_configs(
@@ -123,12 +153,15 @@ def _get_heuristics_config(
             use_f16_accum=use_f16_accum,
             use_batch_invariant=use_batch_invariant,
             gemm_type=gemm_type,
+            use_m_major_input_scale=use_m_major_input_scale,
         )
         for entry in configs:
-            _apply_m_major_input_scale(entry[2], use_m_major_input_scale, layer_config, gemm_type)
+            entry[2].setdefault("mma_type", get_default_mma_type(layer_config).value)
+            _apply_input_scale_tma(entry[2], use_m_major_input_scale, layer_config, gemm_type)
             _disable_indexed_input_scale_tma(entry[2], gemm_type)
             _apply_raster_group_m(entry[2], layer_config, gemm_type)
-        return configs
+            apply_indexed_w4a8_config(entry[2], layer_config, gemm_type)
+        return specialize_w4a8_ranges(configs, layer_config, use_m_major_input_scale, gemm_type)
 
 
 def get_heuristics_config(
@@ -137,10 +170,14 @@ def get_heuristics_config(
     use_f16_accum: bool = False,
     use_batch_invariant: bool = False,
     use_m_major_input_scale: bool = False,
-    gemm_type: str | GemmType = "dense",
+    gemm_type: str | GemmType | None = "dense",
     device: int | torch.device | None = None,
 ):
     device_index = get_device_index(device)
+    # Backend heuristics inspect the test environment; keep their cache entries separate.
+    default_test_source = "heuristic" if "PYTEST_CURRENT_TEST" in os.environ else ""
+    test_sources = os.environ.get("HUMMING_TEST_TUNING_SOURCE", default_test_source).split("+")
+    is_heuristic_test = "heuristic" in (source.strip() for source in test_sources)
     with torch.cuda.device(device_index):
         if isinstance(layer_config, dict):
             layer_config = LayerConfig(**layer_config)
@@ -153,4 +190,5 @@ def get_heuristics_config(
             use_m_major_input_scale,
             gemm_type,
             device_index,
+            is_heuristic_test,
         )

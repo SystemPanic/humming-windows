@@ -3,8 +3,35 @@ import json
 import torch
 
 from humming import ops
-from humming.config import LayerConfig, MmaType
+from humming.config import LayerConfig
 from humming.tune import get_heuristics_class
+
+
+@torch.compiler.assume_constant_result
+def _prepare_forward_configs(
+    compute_config: dict | str | None,
+    tuning_config: dict | list | str | None,
+) -> tuple[str | None, str | None, bool]:
+    """Constant-fold static config processing that Dynamo cannot trace.
+
+    Keep JSON parsing/serialization and similar config-only work here so
+    humming_forward supports full-graph capture. Return strings and scalar
+    metadata to avoid Dynamo guards on parsed dictionaries. Tensor- or
+    shape-dependent work must stay outside this helper.
+    """
+    parsed_compute_config = compute_config
+    if isinstance(parsed_compute_config, str) and parsed_compute_config:
+        parsed_compute_config = json.loads(parsed_compute_config)
+
+    m_major_scale = False
+    if isinstance(parsed_compute_config, dict):
+        m_major_scale = bool(parsed_compute_config.get("use_m_major_input_scale", False))
+
+    if isinstance(compute_config, dict):
+        compute_config = json.dumps(compute_config)
+    if isinstance(tuning_config, (list, dict)):
+        tuning_config = json.dumps(tuning_config)
+    return compute_config, tuning_config, m_major_scale
 
 
 def _resolve_use_pdl(
@@ -104,7 +131,7 @@ def may_quant_input(
         config,
         inputs=inputs,
         outputs=quanted_input,
-        m_major_scale=(config.mma_type == MmaType.MXMMA and config.input_scale_group_size > 0),
+        m_major_scale=(config.use_block_scaled_mma and config.input_scale_group_size > 0),
         use_pdl=use_pdl,
     )
     scale = group_scales if group_scales is not None else token_scales
@@ -135,13 +162,7 @@ def humming_forward(
     hadamard_block_size: int | None = None,
     use_pdl: bool | None = None,
 ) -> torch.Tensor:
-    parsed_compute_config = compute_config
-    if isinstance(parsed_compute_config, str) and parsed_compute_config:
-        parsed_compute_config = json.loads(parsed_compute_config)
-
-    m_major_scale = False
-    if isinstance(parsed_compute_config, dict):
-        m_major_scale = bool(parsed_compute_config.get("use_m_major_input_scale", False))
+    compute_config, tuning_config, m_major_scale = _prepare_forward_configs(compute_config, tuning_config)
 
     unquantized_dtype = [torch.bfloat16, torch.float16, torch.float32]
     should_quantize = config.input_quant_mode.should_quantize
@@ -162,11 +183,6 @@ def humming_forward(
         )
         input_scale = group_scales if config.input_quant_mode.has_group_scale else token_scales
         input_scale_2 = token_scales if config.input_quant_mode.has_secondary_scale else None
-
-    if isinstance(compute_config, dict):
-        compute_config = json.dumps(compute_config)
-    if isinstance(tuning_config, (list, dict)):
-        tuning_config = json.dumps(tuning_config)
 
     return ops.humming_gemm(
         layer_config=config.to_str(),

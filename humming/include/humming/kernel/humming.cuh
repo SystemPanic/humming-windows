@@ -27,7 +27,7 @@ CUDA_INLINE const void *param_to_ptr(void *const &x) { return x; }
 template <
     class MmaOpClass,
     class ProblemShape, class BlockShape, class WarpShape, class PadShape,
-    class ElementA, class ElementB, class ElementC, class ElementBS,
+    class ElementA, class ElementQB, class ElementC, class ElementBS,
     class LayerConfig, class ComputeConfig, class TuningConfig>
 __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPerSm) void humming(
     const __grid_constant__ typename KernelTensorParamType<TuningConfig::kUseTmaA>::Type A,
@@ -55,11 +55,11 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   constexpr bool kUsePdl = TuningConfig::kUsePdl;
 
   using SharedStorage = SharedStorage<
-      MmaOpClass, BlockShape, WarpShape, ElementA, ElementB, ElementBS,
+      MmaOpClass, BlockShape, WarpShape, ElementA, ElementQB, ElementBS,
       LayerConfig, ComputeConfig, TuningConfig>;
   using Ctx = KernelContext<
       MmaOpClass, ProblemShape, BlockShape, WarpShape, PadShape,
-      ElementA, ElementB, ElementC, ElementBS,
+      ElementA, ElementQB, ElementC, ElementBS,
       LayerConfig, ComputeConfig, TuningConfig>;
   using Scheduler = Scheduler<Ctx>;
   using ProducerPipeline = ProducerPipeline<Ctx>;
@@ -136,19 +136,52 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       if (remaining_iters == 1) producer.load_channel();
       PRAGMA_UNROLL
       for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
-        if (warp_iter_id == Ctx::kWarpIters - 1 && remaining_iters > 1) {
-          consumer.wait_stage((stage_id + 1) % kNumStages);
-        }
-        s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
-        mma.run(stage_id, warp_iter_id);
-        if (warp_iter_id == Ctx::kWarpIters - 2) {
-          __syncthreads();
-          if constexpr (kNumStages > 2) {
-            producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+        if constexpr (Ctx::kWgmmaSplitIssueWait) {
+          mma.issue(stage_id, warp_iter_id);
+          if constexpr (Ctx::kWarpIters == 1) {
+            // Refill a different stage; the current WGMMA stage stays live until wait.
+            __syncthreads();
+            if constexpr (kNumStages > 2)
+              producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+          }
+          if (warp_iter_id == Ctx::kWarpIters - 1 && remaining_iters > 1)
+            consumer.wait_stage((stage_id + 1) % kNumStages);
+          const bool use_late_scale_prefetch = Ctx::kUseWgmmaLateScalePrefetch && warp_iter_id == Ctx::kWarpIters - 1;
+          if (use_late_scale_prefetch)
+            s2r_pipe.load_stage_iter_data(stage_id, warp_iter_id + 1);
+          else
+            s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
+          mma.wait_and_promote(stage_id, warp_iter_id);
+          if (use_late_scale_prefetch)
+            s2r_pipe.load_stage_iter_scales(stage_id, warp_iter_id + 1);
+
+          if (Ctx::kWarpIters > 1 && warp_iter_id == Ctx::kWarpIters - 2) {
+            __syncthreads();
+            if constexpr (kNumStages > 2)
+              producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+          }
+        } else {
+          if constexpr (Ctx::kWarpIters == 1) {
+            mma.run(stage_id, warp_iter_id);
+            __syncthreads();
+            if constexpr (kNumStages > 2) {
+              producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+            }
+          }
+          if (warp_iter_id == Ctx::kWarpIters - 1 && remaining_iters > 1) {
+            consumer.wait_stage((stage_id + 1) % kNumStages);
+          }
+          s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
+          if constexpr (Ctx::kWarpIters > 1) mma.run(stage_id, warp_iter_id);
+          if (Ctx::kWarpIters > 1 && warp_iter_id == Ctx::kWarpIters - 2) {
+            __syncthreads();
+            if constexpr (kNumStages > 2) {
+              producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+            }
           }
         }
         mma.transform_b(
-            (warp_iter_id + 1) % 2,
+            ((warp_iter_id + 1) % Ctx::kWarpIters) % 2,
             (warp_iter_id + 1) % Ctx::kWarpIters);
       }
       if constexpr (kNumStages == 2) {

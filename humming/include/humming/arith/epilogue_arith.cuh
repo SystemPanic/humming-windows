@@ -13,6 +13,7 @@ private:
   using BlockShape = typename Ctx::BlockShape;
   using WarpShape = typename Ctx::WarpShape;
   using ElementA = typename Ctx::ElementA;
+  using ElementQB = typename Ctx::ElementQB;
   using ElementB = typename Ctx::ElementB;
   using ElementC = typename Ctx::ElementC;
   using ElementBS = typename Ctx::ElementBS;
@@ -35,15 +36,16 @@ private:
   static constexpr bool kIsGroupOrBlockWeightScale = kIsGroupWeightScale || kIsBlockWeightScale;
   static constexpr bool kHasChannelWeightScale = Ctx::kHasChannelWeightScale;
   static constexpr bool kHasTensorWeightScale = Ctx::kHasTensorWeightScale;
+  static constexpr bool kUseNativeChannelScale = Ctx::kUseUmma && ElementA::kBits <= 8 && kHasChannelWeightScale;
   static constexpr bool kHasZeroPoint = Ctx::kHasZeroPoint;
   static constexpr bool kUseNativeDequantB =
-      Ctx::kUseNativeDequant && kUseNativeWeightDequant<ElementB, ElementA>;
+      Ctx::kUseNativeDequant && kUseNativeWeightDequant<ElementQB, ElementB>;
   static constexpr bool kUseNativeDequantBS =
-      Ctx::kUseNativeDequant && kIsGroupWeightScale && !Ctx::kUseFusedE8m0Scale &&
-      kNativeDequantSupported<ElementBS, ElementA>;
+      kIsGroupWeightScale && !Ctx::kUseFusedE8m0Scale &&
+      kNativeScaleDequantSupported<ElementBS, ElementA>;
 
   static constexpr uint2 kExpOffset = get_epilogue_exp_offset<
-      ElementA, ElementB, ElementC, ElementBS, kHasZeroPoint,
+      ElementA, ElementQB, ElementB, ElementC, ElementBS, kHasZeroPoint,
       kIsF16Accum, kIsGroupInputScale,
       kIsGroupOrBlockWeightScale && !Ctx::kUseFusedE8m0Scale,
       MmaOpClass::kNativeMixed, kUseNativeDequantB, kUseNativeDequantBS>();
@@ -54,11 +56,62 @@ private:
   static constexpr uint32_t kSizeBias = WarpShape::N / 4 * 16 / 32;
 
 public:
+  static constexpr bool kNeedsPackedOutputTransform =
+      (kExpOffset.x != 0 && !kHasTensorWeightScale) ||
+      (kHasChannelWeightScale && !kUseNativeChannelScale) || kHasBias;
+
+  CUDA_INLINE void apply_native_f32_output_scale(float &first, float &second, uint32_t row_group, uint32_t column_group) {
+    float weight_scale = 1.0f;
+    if constexpr (kHasTensorWeightScale) {
+      weight_scale = __uint_as_float(gs);
+      if constexpr (kExpOffset.x) weight_scale *= prepare_exp_scale_factor<float, kExpOffset.x>();
+    }
+    if constexpr (kHasEpilogueInputScale) {
+      const float *scales = reinterpret_cast<const float *>(as);
+      if constexpr (kIsTensorInputScale) {
+        float scale = scales[0] * weight_scale;
+        first *= scale;
+        second *= scale;
+      } else {
+        // The channel loader places row r's scale in lanes 4*r through 4*r+3.
+        // Two-CTA TMEM loads pair adjacent rows; one-CTA loads pair rows four apart.
+        constexpr bool kAdjacentRows = Ctx::kUmmaCtaGroupSize == 2;
+        float scale = scales[row_group] * weight_scale;
+        uint32_t source_lane = (threadIdx.x % 4) * (kAdjacentRows ? 8 : 4);
+        first *= __shfl_sync(0xffffffff, scale, source_lane);
+        second *= __shfl_sync(0xffffffff, scale, source_lane + (kAdjacentRows ? 4 : 16));
+      }
+    }
+    if constexpr (kUseNativeChannelScale) {
+      // Apply channel scaling before narrowing: an FP8 dot product can exceed
+      // FP16's range even when the scaled output is representable.
+      const uint32_t *scales = kIsChannelWeightScale2 ? bs2 : (ElementBS::kBits == 8 ? dq_bs : bs);
+      uint32_t channel = (threadIdx.x % 32) / 4;
+      uint32_t packed_scale = __shfl_sync(0xffffffff, scales[column_group], channel / 2);
+      float2 pair = this->num22float2(*reinterpret_cast<scalar_t2 *>(&packed_scale));
+      float scale = channel % 2 == 0 ? pair.x : pair.y;
+      first *= scale;
+      second *= scale;
+    }
+    if constexpr (kHasTensorWeightScale && !kHasEpilogueInputScale) {
+      first *= weight_scale;
+      second *= weight_scale;
+    }
+  }
+
+  CUDA_INLINE static void apply_packed_output_exp_offset(uint32_t &value) {
+    if constexpr (kExpOffset.x) {
+      const scalar_t2 scale_factor = prepare_exp_scale_factor<scalar_t2, kExpOffset.x>();
+      scalar_t2 &packed = *reinterpret_cast<scalar_t2 *>(&value);
+      packed = __hmul2(packed, scale_factor);
+    }
+  }
+
   uint32_t as[kSizeAS];
   uint32_t bs[MAX(kSizeBS, 2)];
   uint32_t dq_bs[MAX(kSizeDequantBS, 4)];
-  uint32_t bias[kSizeBias];
-  uint32_t bs2[kSizeBias];
+  alignas(16) uint32_t bias[kSizeBias];
+  alignas(16) uint32_t bs2[kSizeBias];
   uint32_t gs = 0;
   uint32_t _dummy;
 
@@ -124,15 +177,7 @@ public:
       if (row == 0 && col == 0) {
         PRAGMA_UNROLL
         for (uint32_t i = 0; i < CEIL_DIV(WarpShape::N, 32); i++) {
-          dequant<ElementBS, ElementC>(bs, dq_bs + i * 4, i);
-          scalar_t *dq_bs_scalar_ptr = reinterpret_cast<scalar_t *>(dq_bs + i * 4);
-
-          PRAGMA_UNROLL
-          for (uint32_t j = 0; j < 2; j++) {
-            scalar_t tmp = dq_bs_scalar_ptr[2 + 4 * j];
-            dq_bs_scalar_ptr[2 + 4 * j] = dq_bs_scalar_ptr[1 + 4 * j];
-            dq_bs_scalar_ptr[1 + 4 * j] = tmp;
-          }
+          dequant_scale<ElementBS, ElementC>(bs, dq_bs + i * 4, i);
         }
 
         const scalar_t2 scale_factor = prepare_exp_scale_factor<scalar_t2, kExpOffset.y>();
@@ -151,11 +196,7 @@ public:
     may_process_on_smem_write(row, col);
 
     auto apply_exp_offset = [&]() {
-      if constexpr (kExpOffset.x && !kHasTensorWeightScale) {
-        const scalar_t2 scale_factor = prepare_exp_scale_factor<scalar_t2, kExpOffset.x>();
-        scalar_t2 *b_f16_ptr = reinterpret_cast<scalar_t2 *>(&regs);
-        b_f16_ptr[0] = __hmul2(b_f16_ptr[0], scale_factor);
-      }
+      if constexpr (!kHasTensorWeightScale) apply_packed_output_exp_offset(regs);
     };
 
     if constexpr (!kIsF16Accum) apply_exp_offset();
@@ -173,11 +214,11 @@ public:
       regs_half2[0] = __hmul2(regs_half2[0], gs_half2[0]);
     }
 
-    if constexpr (kHasChannelWeightScale && kHasBias && !kIsF16Accum) {
+    if constexpr (kHasChannelWeightScale && !kUseNativeChannelScale && kHasBias && !kIsF16Accum) {
       regs_half2[0] = __hfma2(regs_half2[0], cs_half2[col], bias_half2[col]);
-    } else if constexpr (kHasChannelWeightScale) {
+    } else if constexpr (kHasChannelWeightScale && !kUseNativeChannelScale) {
       regs_half2[0] = __hmul2(regs_half2[0], cs_half2[col]);
-    } else if constexpr (kHasBias) {
+    } else if constexpr (kHasBias && !kIsF16Accum) {
       regs_half2[0] = __hadd2(regs_half2[0], bias_half2[col]);
     };
 

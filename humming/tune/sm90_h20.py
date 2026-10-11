@@ -49,10 +49,9 @@ class Sm90H20Heuristics(DeviceHeuristics):
                 "num_ctas_per_sm": 1,
                 "use_tma": use_tma,
                 "use_warp_spec": use_tma,
-                "use_mbarrier": use_tma,
             }
             if overlap:
-                config["reduce_overlap_last_stage_only"] = True
+                config["smem_reuse_mode"] = "last_stage"
             return config
 
         max_output_values = 6 * 1024
@@ -247,6 +246,39 @@ class Sm90H20Heuristics(DeviceHeuristics):
         config.update(num_stages=num_stages, num_ctas_per_sm=num_ctas_per_sm, num_sms=max(1, num_sms))
 
     @classmethod
+    def _tune_large_mxfp4_grouped_contiguous(
+        cls,
+        layer_config: LayerConfig,
+        gemm_type: GemmType,
+        config: dict,
+    ) -> None:
+        """Use higher CTA residency once expert tiles are sufficiently full."""
+        block_m = config["block_shape"][0]
+        has_mxfp4_weights = (
+            layer_config.b_dtype == dtypes.float4e2m1
+            and layer_config.bs_dtype == dtypes.float8e8m0
+            and layer_config.weight_scale_group_size == 32
+        )
+        if (
+            gemm_type != GemmType.GROUPED_CONTIGUOUS
+            or not has_mxfp4_weights
+            or layer_config.shape_k <= 1024
+            or layer_config.shape_n % 128
+            or layer_config.shape_k % 64
+            or block_m < 48
+        ):
+            return
+
+        config.update(
+            block_shape=(48, 128, 64),
+            warp_shape=(48, 32, 64),
+            use_stream_k=False,
+            num_sms=current_device.sm_count,
+            num_stages=4,
+            num_ctas_per_sm=3,
+        )
+
+    @classmethod
     def get_base_config(
         cls,
         a_dtype: dtypes.DataType,
@@ -309,6 +341,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
         use_f16_accum: bool = False,
         use_batch_invariant: bool = False,
         gemm_type: GemmType = GemmType.DENSE,
+        use_m_major_input_scale: bool = False,
     ):
         group_size = layer_config.input_scale_group_size or layer_config.weight_scale_group_size
         is_moe = gemm_type != GemmType.DENSE
@@ -325,10 +358,8 @@ class Sm90H20Heuristics(DeviceHeuristics):
         block_shape_m, block_shape_n, block_shape_k = config["block_shape"]
         num_ctas_per_sm = config.get("num_ctas_per_sm", 1)
         warp_shape_m, warp_shape_n, warp_shape_k = config["warp_shape"]
-        if layer_config.use_packed_k_layout:
-            warp_shape_n = max(warp_shape_n, 32)
         num_stages = 3
-        min_warp_shape_n = 32 if a_dtype.num_bits == 16 or layer_config.use_packed_k_layout else 16
+        min_warp_shape_n = 32 if a_dtype.num_bits == 16 else 16
         while layer_config.shape_n % block_shape_n:
             block_shape_n //= 2
             warp_shape_n = min(warp_shape_n, block_shape_n // 4)
@@ -464,7 +495,6 @@ class Sm90H20Heuristics(DeviceHeuristics):
 
         if layer_config.shape_k <= 512 and is_moe and shape_m >= 2048:
             config["use_tma"] = True
-            config["use_mbarrier"] = True
             if gemm_type == GemmType.INDEXED:
                 config["use_tma_a"] = False
                 config["use_tma_c"] = False
@@ -484,7 +514,6 @@ class Sm90H20Heuristics(DeviceHeuristics):
         if use_dense_tma:
             config["use_tma"] = True
             config["use_warp_spec"] = True
-            config["use_mbarrier"] = True
             config["num_stages"] = 3
         elif config["num_stages"] == 4 and block_shape_m <= 32:
             block_shape = (block_shape_m, block_shape_n, block_shape_k)
@@ -496,6 +525,7 @@ class Sm90H20Heuristics(DeviceHeuristics):
             config.update(cls._get_small_m_dense_override(layer_config, shape_m, block_shape_m) or {})
         elif is_moe and not use_batch_invariant:
             cls._tune_long_k_moe_residency(layer_config, shape_m, gemm_type, config)
+            cls._tune_large_mxfp4_grouped_contiguous(layer_config, gemm_type, config)
 
         if use_batch_invariant:
             warp_shape_k = 512 // layer_config.a_dtype.num_bits
@@ -505,7 +535,12 @@ class Sm90H20Heuristics(DeviceHeuristics):
             # TODO: check if TMA / cp.async affect batch invariance
             config["use_tma"] = False
             config["use_warp_spec"] = False
-            config["use_mbarrier"] = False
             config["use_stream_k"] = False
+
+        if layer_config.use_packed_k_layout:
+            block_m, block_n, block_k = config["block_shape"]
+            warp_m, warp_n, _ = config["warp_shape"]
+            config["warp_shape"] = (warp_m, warp_n, 128)
+            config["block_shape"] = (block_m, block_n, 128 if use_batch_invariant else max(block_k, 128))
 
         return config

@@ -2,6 +2,7 @@ import math
 
 from humming import dtypes
 from humming.config import GemmType, MmaType
+from humming.config.mma import get_default_mma_type
 from humming.device import current_device
 from humming.tune.sm8x import Sm89Heuristics
 from humming.utils.math import round_up
@@ -19,6 +20,11 @@ class Sm120Heuristics(Sm89Heuristics):
     ]
     b4_allowed_dtypes: list[dtypes.DataType] = [dtypes.float4e2m1, dtypes.float4e0m3]
 
+    @staticmethod
+    def _has_complete_warpgroups(config) -> bool:
+        num_math_warps = math.prod(config["block_shape"]) // math.prod(config["warp_shape"])
+        return num_math_warps % 4 == 0
+
     @classmethod
     def should_use_pdl_for_input(cls, layer_config, shape_m: int) -> bool:
         return layer_config.shape_n >= 4096 and shape_m <= 32
@@ -33,7 +39,8 @@ class Sm120Heuristics(Sm89Heuristics):
         num_ctas_per_sm: int,
     ) -> int:
         block_shape_m, block_shape_n = block_shape
-        unsupported = gemm_type != GemmType.DENSE or layer_config.mma_type not in (MmaType.MMA, MmaType.MXMMA)
+        mma_type = get_default_mma_type(layer_config)
+        unsupported = gemm_type != GemmType.DENSE or mma_type not in (MmaType.MMA, MmaType.MXMMA)
         unsuitable_m = block_shape_m <= 16 or shape_m <= block_shape_m <= 32
         if unsupported or unsuitable_m:
             return block_shape_m
@@ -110,6 +117,7 @@ class Sm120Heuristics(Sm89Heuristics):
         use_f16_accum: bool = False,
         use_batch_invariant: bool = False,
         gemm_type: GemmType = GemmType.DENSE,
+        use_m_major_input_scale: bool = False,
     ):
         config = super().get_config(
             layer_config,
@@ -117,6 +125,7 @@ class Sm120Heuristics(Sm89Heuristics):
             use_f16_accum,
             use_batch_invariant,
             gemm_type,
+            use_m_major_input_scale,
         )
         if use_batch_invariant:
             return config
@@ -125,17 +134,16 @@ class Sm120Heuristics(Sm89Heuristics):
         is_wna16 = a.is_floating_point_type and a.num_bits == 16 and not use_f16_accum
         if a.is_floating_point_type and a.num_bits <= 8 and not layer_config.use_fused_e8m0_scale:
             config["use_tma"] = True
-            config["use_warp_spec"] = True
+            config["use_warp_spec"] = cls._has_complete_warpgroups(config)
         elif is_wna16:
             config["use_tma"] = True
-            block_shape = config["block_shape"]
-            warp_shape = config["warp_shape"]
-            m_warps = block_shape[0] // warp_shape[0]
-            n_warps = block_shape[1] // warp_shape[1]
-            k_warps = block_shape[2] // warp_shape[2]
-            num_math_threads = m_warps * n_warps * k_warps * 32
-            config["use_warp_spec"] = num_math_threads % 128 == 0
-            config["num_stages"] = cls._fit_num_stages(layer_config, config, gemm_type, reduce_overlap=False)
+            config["use_warp_spec"] = cls._has_complete_warpgroups(config)
+            config["num_stages"] = cls._fit_num_stages(
+                layer_config,
+                config,
+                gemm_type,
+                smem_reuse_mode="all_stages",
+            )
 
         if gemm_type == GemmType.INDEXED:
             config["use_tma_a"] = False
@@ -145,9 +153,9 @@ class Sm120Heuristics(Sm89Heuristics):
         if gemm_type != GemmType.DENSE and is_wna16 and layer_config.b_dtype.num_bits <= 8:
             tokens_per_expert = shape_m / layer_config.num_experts
             if tokens_per_expert >= 96:
-                cls._use_m_tile(layer_config, config, gemm_type, 128)
+                cls._use_m_tile(layer_config, config, gemm_type, 128, shape_m)
             elif tokens_per_expert >= 48:
-                cls._use_m_tile(layer_config, config, gemm_type, 64)
+                cls._use_m_tile(layer_config, config, gemm_type, 64, shape_m)
 
         num_b_bits = layer_config.b_dtype.num_bits
         block_m = config["block_shape"][0]
@@ -157,9 +165,9 @@ class Sm120Heuristics(Sm89Heuristics):
         group_size = layer_config.input_scale_group_size or layer_config.weight_scale_group_size
         is_mxmma = cls._is_mxmma(layer_config.a_dtype, group_size, layer_config.use_fused_e8m0_scale)
         if gemm_type != GemmType.INDEXED and is_mxmma:
-            num_stages = cls._fit_num_stages(layer_config, config, gemm_type, reduce_overlap=True)
+            num_stages = cls._fit_num_stages(layer_config, config, gemm_type, smem_reuse_mode="last_stage")
             config["num_stages"] = num_stages
-            config["reduce_overlap_last_stage_only"] = True
+            config["smem_reuse_mode"] = "last_stage"
 
         if gemm_type == GemmType.DENSE:
             num_blocks_n = layer_config.shape_n // config["block_shape"][1]
@@ -202,6 +210,8 @@ class Sm120Heuristics(Sm89Heuristics):
                 mn_warps = block_m // warp_m * (block_n // warp_n)
                 target_k_warps = max(1, 4 // mn_warps)
                 config["warp_shape"] = (warp_m, warp_n, max(warp_k, block_k // target_k_warps))
+                if not cls._has_complete_warpgroups(config):
+                    config["use_warp_spec"] = False
 
             cls._rebalance_dense_warps(layer_config, config, shape_m)
             if is_mxmma:
@@ -211,7 +221,7 @@ class Sm120Heuristics(Sm89Heuristics):
                         layer_config,
                         config,
                         gemm_type,
-                        reduce_overlap=config.get("reduce_overlap_last_stage_only", False),
+                        smem_reuse_mode=config.get("smem_reuse_mode", "all_stages"),
                     ),
                 )
 
@@ -271,7 +281,9 @@ class Sm120Heuristics(Sm89Heuristics):
         block_m, block_n, _ = config["block_shape"]
         _, warp_n, _ = config["warp_shape"]
         mma_k = 1024 // layer_config.a_dtype.num_bits
-        block_k = min(layer_config.shape_k, mma_k * 2)
+        block_k = mma_k * 2
+        while block_k > layer_config.shape_k:
+            block_k //= 2
         if layer_config.shape_k % block_k:
             return
 
@@ -310,10 +322,10 @@ class Sm120Heuristics(Sm89Heuristics):
                 GemmType.DENSE,
                 num_stages,
                 warp_shape=candidate["warp_shape"],
-                reduce_overlap_last_stage_only=candidate.get("reduce_overlap_last_stage_only", False),
-                use_mbarrier=True,
+                smem_reuse_mode=candidate.get("smem_reuse_mode", "all_stages"),
+                use_tma=candidate.get("use_tma", False),
                 use_warp_spec=candidate.get("use_warp_spec", False),
-                num_write_splits=candidate.get("num_write_splits", 1),
+                output_chunk_rows=candidate.get("output_chunk_rows", 0),
             )
             if smem <= cls.max_smem_size:
                 candidate["num_stages"] = num_stages
@@ -338,15 +350,45 @@ class Sm120Heuristics(Sm89Heuristics):
         )
 
     @classmethod
-    def _use_m_tile(cls, layer_config, config, gemm_type, block_m: int) -> None:
+    def _use_m_tile(cls, layer_config, config, gemm_type, block_m: int, shape_m: int) -> None:
         _, block_n, block_k = config["block_shape"]
         _, warp_n, warp_k = config["warp_shape"]
         config["block_shape"] = (block_m, block_n, block_k)
         config["warp_shape"] = (block_m, warp_n, warp_k)
-        config["num_stages"] = cls._fit_num_stages(layer_config, config, gemm_type, reduce_overlap=False)
+        config["use_warp_spec"] = config.get("use_warp_spec", False) and cls._has_complete_warpgroups(config)
+        config["num_stages"] = cls._fit_num_stages(
+            layer_config,
+            config,
+            gemm_type,
+            smem_reuse_mode="all_stages",
+        )
+
+        m_tiles = cls.estimate_num_blocks_m(layer_config, shape_m, block_m)
+        min_grid_blocks = math.ceil(current_device.sm_count * 2 / 3)
+        has_sparse_grid = m_tiles * (layer_config.shape_n // block_n) < min_grid_blocks
+        if block_n <= 64 or not has_sparse_grid:
+            return
+
+        # A larger M tile can leave too few output tiles and consume the
+        # shared memory needed for pipelining. Narrow N only if both improve.
+        block_n //= 2
+        warp_n = min(warp_n, 32)
+        k_warps = max(1, 8 // (block_n // warp_n))
+        warp_k = max(32, block_k // k_warps)
+        candidate = config | {
+            "block_shape": (block_m, block_n, block_k),
+            "warp_shape": (block_m, warp_n, warp_k),
+            "num_sms": current_device.sm_count,
+        }
+        candidate["use_warp_spec"] &= cls._has_complete_warpgroups(candidate)
+        candidate["num_stages"] = cls._fit_num_stages(
+            layer_config, candidate, gemm_type, smem_reuse_mode="all_stages"
+        )
+        if candidate["num_stages"] > config["num_stages"]:
+            config.update(candidate)
 
     @classmethod
-    def _fit_num_stages(cls, layer_config, config, gemm_type, reduce_overlap: bool) -> int:
+    def _fit_num_stages(cls, layer_config, config, gemm_type, smem_reuse_mode: str) -> int:
         best = None
         for num_stages in range(2, 6 if cls.sm_version == 121 else 5):
             smem = estimate_smem_size_layer(
@@ -355,10 +397,10 @@ class Sm120Heuristics(Sm89Heuristics):
                 gemm_type,
                 num_stages,
                 warp_shape=config["warp_shape"],
-                reduce_overlap_last_stage_only=reduce_overlap,
-                use_mbarrier=True,
+                smem_reuse_mode=smem_reuse_mode,
+                use_tma=config.get("use_tma", False),
                 use_warp_spec=config["use_warp_spec"],
-                num_write_splits=config.get("num_write_splits", 1),
+                output_chunk_rows=config.get("output_chunk_rows", 0),
             )
             if smem <= cls.max_smem_size:
                 best = num_stages

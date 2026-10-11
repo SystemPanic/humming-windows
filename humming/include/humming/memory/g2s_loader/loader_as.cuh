@@ -6,32 +6,35 @@
 template <class Ctx, bool kSecondary = false>
 class G2SMemoryLoaderAS {
 private:
+  using SharedStorage = typename Ctx::SharedStorage;
   using ProblemShape = typename Ctx::ProblemShape;
   using BlockShape = typename Ctx::BlockShape;
   using PadShape = typename Ctx::PadShape;
   using ElementA = typename Ctx::ElementA;
 
-  static constexpr bool kUseMxmma = Ctx::kUseMxmma;
+  static constexpr bool kUseBlockScaledMma = Ctx::kUseBlockScaledMma;
   static constexpr bool kUseWarpSpec = Ctx::kUseWarpSpec;
   static constexpr bool kUseCpAsync = Ctx::kUseCpAsync;
   static constexpr bool kIsIndexedGemm = Ctx::kIsIndexedGemm;
   static constexpr bool kIsGroupedGemm = Ctx::kIsGroupedGemm;
 
   static constexpr uint32_t kNumLoadThreads = Ctx::kNumLoadThreads;
-  static constexpr uint32_t kLoadThreadOffset = Ctx::kNumThreads - kNumLoadThreads;
+  static constexpr uint32_t kLoadThreadOffset = Ctx::kLoadThreadOffset;
 
   static constexpr bool kConfiguredInputScale = kSecondary ? Ctx::kHasInputScale2 : Ctx::kHasInputScale;
   static constexpr bool kIsTensorScale = kSecondary ? Ctx::kIsTensorInputScale2 : Ctx::kIsTensorInputScale;
   static constexpr bool kHasInputScale = kConfiguredInputScale && !kIsTensorScale;
   static constexpr bool kIsChannelScale = kHasInputScale && (kSecondary || !Ctx::kIsGroupInputScale);
   static constexpr bool kIsGroupScale = kHasInputScale && !kSecondary && Ctx::kIsGroupInputScale;
-  static constexpr bool kUseMxScale = kUseMxmma && kIsGroupScale;
+  static constexpr bool kUseMxScale = kUseBlockScaledMma && kIsGroupScale;
   static constexpr bool kMMajorInputScale = Ctx::kUseMMajorInputScale && kIsGroupScale;
   static_assert(!kMMajorInputScale || !kIsIndexedGemm);
   static constexpr bool kConfiguredUseTma = kSecondary ? Ctx::kUseTmaAS2 : Ctx::kUseTmaAS;
   static constexpr bool kUseTma = kConfiguredUseTma && kHasInputScale && !kIsIndexedGemm;
   static_assert(!kConfiguredUseTma || !kIsTensorScale);
-  static_assert(!kUseTma || kMMajorInputScale || kIsChannelScale || kUseMxmma);
+  static_assert(!kUseTma || kMMajorInputScale || kIsChannelScale || kUseBlockScaledMma);
+  static constexpr bool kUseRowMajorTma = kUseTma && kUseMxScale && !kMMajorInputScale;
+  static_assert(!kUseRowMajorTma || SharedStorage::kUseUmmaRowMajorSmemInputScale);
   static constexpr uint32_t kGroupSize = kIsGroupScale ? Ctx::kInputScaleGroupSize : ProblemShape::K;
 
   static_assert(ProblemShape::K == kGroupSize || (ProblemShape::K - PadShape::K) % kGroupSize == 0);
@@ -45,7 +48,16 @@ private:
   static constexpr uint32_t kScaleBlockM = BlockShape::M + (kIsGroupedGemm ? kScaleMAlignment : 0);
   static constexpr uint32_t kScaleBlockMVecs = kScaleBlockM / kScaleMAlignment;
   static_assert(BlockShape::M % kScaleMAlignment == 0);
-  static_assert(!kUseTma || kScaleBlockM <= 256);
+  // A TMA box holds at most 256 elements per dimension: wider M-major tiles use 64-bit elements.
+  static constexpr bool kUseWideTmaElements = kUseTma && kUseMxScale && kMMajorInputScale && kScaleBlockM > 256;
+  static_assert(!kUseTma || kScaleBlockM <= 256 || kUseMxScale);
+
+  // One uint4 gather per routed row covers four single-group stages. Stream-K is
+  // excluded so every tile starts on a vector boundary; the plain smem stores
+  // rely on the CTA barrier of the non-mbarrier pipeline.
+  static constexpr bool kUseIndexedScaleCache =
+      kIsIndexedGemm && kIsGroupScale && !kUseMxScale && Ctx::kWgmmaUseLateAS && !Ctx::kUseMBarrier &&
+      !Ctx::kUseStreamK && kNumGroups == 1 && kProblemNumGroups % 4 == 0;
 
   using LoadType = typename LoadTypeChooser<kNumGroups * 4>::Type;
 
@@ -63,6 +75,7 @@ public:
   uint32_t load_row_index[kRowLoadIters];
   uint32_t col_offset = 0;
   uint32_t counter = 0;
+  uint4 indexed_scale_cache[kRowLoadIters];
 
   CUDA_INLINE
   G2SMemoryLoaderAS(Ctx &ctx)
@@ -83,10 +96,41 @@ public:
     if constexpr (kUseMxScale) {
       if constexpr (kUseTma) load_mx_tma(smem_ptr, mbar_ptr);
       else if constexpr (kMMajorInputScale) load_mx_legacy_m_major(smem_ptr);
+      else if constexpr (SharedStorage::kUseUmmaRowMajorSmemInputScale) load_mx_legacy_row_major(smem_ptr);
       else load_mx_legacy(smem_ptr);
     } else if constexpr (kUseTma) load_tma(smem_ptr, mbar_ptr);
+    else if constexpr (kUseIndexedScaleCache) load_legacy_indexed_cached(smem_ptr);
     else load_legacy(smem_ptr);
     if constexpr (kShouldAdvance) advance();
+  }
+
+  CUDA_INLINE void load_mx_legacy_row_major(void *smem_ptr) {
+    constexpr uint32_t kRowWords = BlockShape::K / (sizeof(uint32_t) * kGroupSize);
+    constexpr uint32_t kGmemStrideWords = CEIL_DIV(kProblemNumGroups, 4);
+    constexpr bool kHasAlignedRows = kGmemStrideWords % 4 == 0;
+    constexpr bool kUseWideRows = SharedStorage::kUseUmmaWideRowInputScale;
+    constexpr uint32_t kSlotWords = kUseWideRows ? 4 : kRowWords;
+    constexpr uint32_t kLoadWords = kHasAlignedRows && kSlotWords % 4 == 0 ? 4 : 1;
+    using RowLoadType = typename LoadTypeChooser<kLoadWords * 4>::Type;
+    // cp.async bypasses L1 only for 16-byte loads: load the aligned vector holding this stage.
+    const uint32_t vector_word = kUseWideRows ? (col_offset / 4) % 4 : 0;
+    const uint32_t source_shift = kLoadWords == 4 ? vector_word : 0;
+    const uint32_t slot_shift = kLoadWords == 4 ? 0 : vector_word;
+    constexpr uint32_t kRowLoads = (kLoadWords == 4 ? kSlotWords : kRowWords) / kLoadWords;
+    PRAGMA_UNROLL
+    for (uint32_t i = 0; i < kRowLoadIters; i++) {
+      uint32_t row = i * kNumLoadThreads + ctx.load_thread_id();
+      uint32_t source_row = kIsIndexedGemm ? load_row_index[i] : row;
+      bool is_valid_row = kIsIndexedGemm ? (row < BlockShape::M && source_row < shape_m) : (row < block_shape_m);
+      const uint32_t *source_words = gmem_ptr + source_row * kGmemStrideWords - source_shift;
+      uint32_t *slot_words = reinterpret_cast<uint32_t *>(smem_ptr) + row * kSlotWords + slot_shift;
+      const auto *source = reinterpret_cast<const RowLoadType *>(source_words);
+      auto *destination = reinterpret_cast<RowLoadType *>(slot_words);
+      PRAGMA_UNROLL
+      for (uint32_t part = 0; part < kRowLoads; part++) {
+        legacy_load_pred<kUseCpAsync>(source + part, destination + part, is_valid_row);
+      }
+    }
   }
 
   CUDA_INLINE void load_mx_legacy(void *smem_ptr) {
@@ -95,7 +139,7 @@ public:
     const uint32_t *gmem_ptr_load = reinterpret_cast<const uint32_t *>(gmem_ptr);
 
     constexpr uint32_t kNumRows = CEIL_DIV(BlockShape::K / kPartMmaShapeK * kMxScaleVec, 4);
-    constexpr uint32_t kMxGmemStride = ProblemShape::K / kPartMmaShapeK * kMxScaleVec / 4;
+    constexpr uint32_t kMxGmemStride = CEIL_DIV(kProblemNumGroups, 4);
     constexpr uint32_t kNumInts = BlockShape::M * kNumRows;
 
     if constexpr (kNumInts <= kNumLoadThreads) {
@@ -105,7 +149,7 @@ public:
       uint32_t smem_offset = smem_row * kScaleBlockM + smem_col;
 
       uint32_t gmem_row = smem_col;
-      if constexpr (kIsIndexedGemm) gmem_row = ctx.smem.rd_row_index[smem_col];
+      if constexpr (kIsIndexedGemm) gmem_row = ctx.get_rd_row_index()[smem_col];
       uint32_t gmem_col = smem_row;
       uint32_t gmem_offset = gmem_row * kMxGmemStride + gmem_col;
       uint32_t row_bound = kIsIndexedGemm ? shape_m : block_shape_m;
@@ -154,23 +198,51 @@ public:
 
   CUDA_INLINE void load_tma(void *smem_ptr, void *mbar_ptr) {
     static_assert(!kIsIndexedGemm && (kMMajorInputScale || kIsChannelScale));
-    if (ctx.load_thread_id() == 0) {
+    constexpr uint32_t kLoadThread = Ctx::kUseUmmaSplitLoads && !kIsChannelScale ? 32 : 0;
+    if (ctx.load_thread_id() == kLoadThread) {
       if constexpr (kIsChannelScale) tma_load_1d(tensor_map_ptr, smem_ptr, mbar_ptr, load_row_offset);
-      else tma_load_2d(tensor_map_ptr, smem_ptr, mbar_ptr, load_row_offset, col_offset);
+      else tma_load_2d<>(tensor_map_ptr, smem_ptr, mbar_ptr, load_row_offset, col_offset);
     }
   }
 
+  CUDA_INLINE uint32_t m_major_tma_row() { return kUseWideTmaElements ? load_row_offset / 2 : load_row_offset; }
+
+  CUDA_INLINE uint32_t row_major_tma_column() {
+    return SharedStorage::kUseUmmaWideRowInputScale ? col_offset / 16 * 4 : col_offset / 4;
+  }
+
   CUDA_INLINE void load_mx_tma(void *smem_ptr, void *mbar_ptr) {
-    static_assert(kMMajorInputScale && !kIsIndexedGemm);
-    if (ctx.load_thread_id() == 0) tma_load_2d(tensor_map_ptr, smem_ptr, mbar_ptr, load_row_offset, col_offset / 4);
+    static_assert(!kIsIndexedGemm);
+    constexpr uint32_t kLoadThread = Ctx::kUseUmmaSplitLoads ? 32 : 0;
+    if (ctx.load_thread_id() != kLoadThread) return;
+    if constexpr (kMMajorInputScale) tma_load_2d<>(tensor_map_ptr, smem_ptr, mbar_ptr, m_major_tma_row(), col_offset / 4);
+    else tma_load_2d<>(tensor_map_ptr, smem_ptr, mbar_ptr, row_major_tma_column(), load_row_offset);
   }
 
   CUDA_INLINE void prefetch_tma() {
     if constexpr (kUseTma) {
       if (ctx.load_thread_id() == 0) {
-        if constexpr (kUseMxScale) tma_prefetch_2d(tensor_map_ptr, load_row_offset, col_offset / 4);
+        if constexpr (kUseRowMajorTma) tma_prefetch_2d(tensor_map_ptr, row_major_tma_column(), load_row_offset);
+        else if constexpr (kUseMxScale) tma_prefetch_2d(tensor_map_ptr, m_major_tma_row(), col_offset / 4);
         else if constexpr (kIsChannelScale) tma_prefetch_1d(tensor_map_ptr, load_row_offset);
         else tma_prefetch_2d(tensor_map_ptr, load_row_offset, col_offset);
+      }
+    }
+  }
+
+  CUDA_INLINE void load_legacy_indexed_cached(void *smem_ptr) {
+    uint32_t thread_id = ctx.load_thread_id();
+    uint32_t *smem_ptr_load = reinterpret_cast<uint32_t *>(smem_ptr);
+    const uint32_t component = col_offset % 4;
+    PRAGMA_UNROLL
+    for (uint32_t i = 0; i < kRowLoadIters; i++) {
+      uint32_t row = i * kNumLoadThreads + thread_id;
+      uint32_t source_row = load_row_index[i];
+      if (row < BlockShape::M && source_row < shape_m) {
+        if (component == 0)
+          indexed_scale_cache[i] = *reinterpret_cast<const uint4 *>(gmem_ptr + source_row * kProblemNumGroups);
+        const uint4 v = indexed_scale_cache[i];
+        smem_ptr_load[row] = component == 0 ? v.x : component == 1 ? v.y : component == 2 ? v.z : v.w;
       }
     }
   }
@@ -239,6 +311,7 @@ public:
 
   CUDA_INLINE
   void seek(uint32_t, uint32_t m_block_id, uint32_t k_block_id, uint32_t current_shape_m, uint32_t m_offset) {
+    if constexpr (kUseMxScale) counter = 0;
     if constexpr (kIsGroupScale) {
       if constexpr (BlockShape::K >= kGroupSize) {
         col_offset = k_block_id * kNumGroups;
@@ -268,7 +341,7 @@ public:
           if constexpr (kMMajorInputScale)
             gmem_ptr = gmem_ptr_raw + ((col_offset / 4) * total_shape_m + MIN(load_row_offset, total_shape_m));
           else
-            gmem_ptr = gmem_ptr_raw + (row_offset * (kProblemNumGroups / 4) + col_offset / 4);
+            gmem_ptr = gmem_ptr_raw + (row_offset * CEIL_DIV(kProblemNumGroups, 4) + col_offset / 4);
         }
       } else if constexpr (kUseTma) {
         // tma loads via tensor map; gmem_ptr unused
@@ -285,7 +358,7 @@ public:
       PRAGMA_UNROLL
       for (uint32_t i = 0; i < kRowLoadIters; i++) {
         uint32_t smem_row = i * kNumLoadThreads + ctx.load_thread_id();
-        load_row_index[i] = smem_row < BlockShape::M ? ctx.smem.rd_row_index[smem_row] : shape_m;
+        load_row_index[i] = smem_row < BlockShape::M ? ctx.get_rd_row_index()[smem_row] : shape_m;
       }
     }
   }

@@ -1,12 +1,12 @@
 from humming import dtypes
 from humming.config import GemmType, LayerConfig
 from humming.device import current_device
-from humming.tune.base import DeviceHeuristics
 from humming.tune.candidate import (
     DeviceProfile,
     TuningDecision,
     TuningProblem,
 )
+from humming.tune.sm8x import Sm80Heuristics
 from humming.tune.sm90_policies import (
     Sm90CandidatePolicy,
     build_sm90_seed_config,
@@ -17,7 +17,7 @@ from humming.tune.sm90_policies import (
 from humming.utils.smem import estimate_smem_size_layer
 
 
-class Sm90Heuristics(DeviceHeuristics):
+class Sm90Heuristics(Sm80Heuristics):
     max_smem_size: int = 227 * 1024
     candidate_policy = Sm90CandidatePolicy()
     b16_allowed_dtypes: list[dtypes.DataType] = [dtypes.float16, dtypes.bfloat16]
@@ -166,7 +166,13 @@ class Sm90Heuristics(DeviceHeuristics):
         use_f16_accum: bool = False,
         use_batch_invariant: bool = False,
         gemm_type: GemmType = GemmType.DENSE,
+        use_m_major_input_scale: bool = False,
     ):
+        if layer_config.a_dtype == dtypes.int4:
+            return super().get_config(
+                layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type, use_m_major_input_scale
+            )
+
         use_grouped_scale_candidates = cls._uses_grouped_scale_candidates(layer_config)
         use_indexed_a16_policy = cls._uses_indexed_a16_policy(layer_config, use_batch_invariant, gemm_type)
         use_candidates = use_grouped_scale_candidates or use_indexed_a16_policy
@@ -193,10 +199,10 @@ class Sm90Heuristics(DeviceHeuristics):
                 gemm_type,
                 config["num_stages"],
                 warp_shape=config["warp_shape"],
-                reduce_overlap_last_stage_only=config.get("reduce_overlap_last_stage_only", False),
-                use_mbarrier=config.get("use_mbarrier", False),
+                smem_reuse_mode=config.get("smem_reuse_mode", "all_stages"),
+                use_tma=config.get("use_tma", False),
                 use_warp_spec=config.get("use_warp_spec", False),
-                num_write_splits=config.get("num_write_splits", 1),
+                output_chunk_rows=config.get("output_chunk_rows", 0),
                 mma_accum_bits=16 if use_f16_accum else 32,
             )
             if smem_size <= cls.max_smem_size:

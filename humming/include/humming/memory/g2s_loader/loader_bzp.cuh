@@ -9,23 +9,23 @@ private:
   using ProblemShape = typename Ctx::ProblemShape;
   using BlockShape = typename Ctx::BlockShape;
   using ElementA = typename Ctx::ElementA;
-  using ElementB = typename Ctx::ElementB;
+  using ElementQB = typename Ctx::ElementQB;
 
   static constexpr bool kUseWarpSpec = Ctx::kUseWarpSpec;
   static constexpr bool kUseTma = Ctx::kUseTmaBZP;
   static constexpr bool kUseCpAsync = Ctx::kUseCpAsync;
   static constexpr uint32_t kNumLoadThreads = Ctx::kNumLoadThreads;
-  static constexpr uint32_t kLoadThreadOffset = Ctx::kNumThreads - kNumLoadThreads;
+  static constexpr uint32_t kLoadThreadOffset = Ctx::kLoadThreadOffset;
 
   static constexpr bool kIsFpZeroPoint = Ctx::kIsFpZeroPoint;
   static constexpr bool kIsChannel = Ctx::kIsChannelWeightScale;
   static constexpr bool kIsGroup = Ctx::kIsGroupWeightScale;
-  static constexpr bool kUseMxmma = Ctx::kUseMxmma;
+  static constexpr bool kEvictWeightsFirst = Ctx::kUseUmma && Ctx::kIsDenseGemm && kIsGroup && Ctx::kRasterGroupM > 1;
   static constexpr uint32_t kGroupSize = kIsGroup ? Ctx::kWeightScaleGroupSize : ProblemShape::K;
 
   static constexpr uint32_t kPartMmaShapeK = Ctx::kPartMmaShapeK;
-  static constexpr uint32_t kNumGroupsPerMma = kUseMxmma && ElementA::kBits == 4 && kIsGroup ? kPartMmaShapeK / kGroupSize : 1;
-  static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementB::kBits));
+  static constexpr uint32_t kNumGroupsPerMma = Ctx::kUseBlockScaledMma && ElementA::kBits == 4 && kIsGroup ? kPartMmaShapeK / kGroupSize : 1;
+  static constexpr uint32_t kNumZPBits = kIsFpZeroPoint ? 16 : MAX(4, static_next_power_of_2(ElementQB::kBits));
   static constexpr uint32_t kSmemStride = BlockShape::N * kNumZPBits / 32 / 4 * kNumGroupsPerMma;
   static constexpr uint32_t kGmemStride = ProblemShape::N * kNumZPBits / 32 / 4 * kNumGroupsPerMma;
   static constexpr uint32_t kProblemNumRows = CEIL_DIV(ProblemShape::K, kGroupSize) / kNumGroupsPerMma;
@@ -64,13 +64,13 @@ public:
 
   CUDA_INLINE
   void load_tma(int4 *smem_ptr, void *mbar_ptr) {
-    if (ctx.load_thread_id() == 0) tma_load_2d(tensor_map_ptr, smem_ptr, mbar_ptr, col_offset, row_offset);
+    if (ctx.load_thread_id() == 0) tma_load_2d<1, kEvictWeightsFirst>(tensor_map_ptr, smem_ptr, mbar_ptr, col_offset, row_offset);
   }
 
   CUDA_INLINE
   void prefetch_tma() {
     if constexpr (kUseTma) {
-      if (ctx.load_thread_id() == 0) tma_prefetch_2d(tensor_map_ptr, col_offset, row_offset);
+      if (ctx.load_thread_id() == 0) tma_prefetch_2d<kEvictWeightsFirst>(tensor_map_ptr, col_offset, row_offset);
     }
   }
 

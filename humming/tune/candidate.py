@@ -4,7 +4,11 @@ from collections.abc import Mapping
 from typing import Any
 
 from humming import dtypes
-from humming.config import GemmType, LayerConfig, MmaType
+from humming.config import GemmType, LayerConfig, MmaType, SmemReuseMode
+from humming.config.mma import (
+    get_default_mma_type,
+    get_register_budget_error,
+)
 from humming.utils.smem import estimate_smem_size_layer
 
 
@@ -16,11 +20,12 @@ class DeviceProfile:
     max_smem_size: int
     max_smem_per_sm: int | None = None
     max_threads_per_sm: int = 2048
+    max_registers_per_sm: int = 64 * 1024
 
     def __post_init__(self) -> None:
         if self.num_sms is not None and self.num_sms <= 0:
             raise ValueError("num_sms must be positive")
-        for name in ("max_smem_size", "max_threads_per_sm"):
+        for name in ("max_smem_size", "max_threads_per_sm", "max_registers_per_sm"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
         if self.max_smem_per_sm is not None and self.max_smem_per_sm <= 0:
@@ -59,6 +64,9 @@ class ScheduleCandidate:
     candidate_id: str
     block_shape: tuple[int, int, int]
     warp_shape: tuple[int, int, int]
+    mma_type: MmaType | None = None
+    wgmma_use_late_as: bool = False
+    wgmma_split_issue_wait: bool = False
     use_stream_k: bool = True
     use_f16_accum: bool = False
     num_stages: int = 2
@@ -66,7 +74,7 @@ class ScheduleCandidate:
     multi_cast_size_a: int = 1
     use_warp_spec: bool = False
     use_tma: bool = False
-    use_mbarrier: bool = False
+    smem_reuse_mode: SmemReuseMode = SmemReuseMode.ALL_STAGES
     _explicit_fields: frozenset[str] = dataclasses.field(default_factory=frozenset, repr=False)
 
     def __post_init__(self) -> None:
@@ -103,8 +111,11 @@ class ScheduleCandidate:
         use_warp_spec = _config_bool(config, "use_warp_spec", False)
         return cls(
             candidate_id=candidate_id,
+            mma_type=MmaType(config["mma_type"]) if config.get("mma_type") else None,
             block_shape=_positive_shape(config["block_shape"], "block_shape"),
             warp_shape=_positive_shape(config["warp_shape"], "warp_shape"),
+            wgmma_use_late_as=_config_bool(config, "wgmma_use_late_as", False),
+            wgmma_split_issue_wait=_config_bool(config, "wgmma_split_issue_wait", False),
             use_stream_k=_config_bool(config, "use_stream_k", True),
             use_f16_accum=_config_bool(config, "use_f16_accum", False),
             num_stages=_config_positive_int(config, "num_stages", 2),
@@ -112,12 +123,7 @@ class ScheduleCandidate:
             multi_cast_size_a=_config_positive_int(config, "multi_cast_size_a", 1),
             use_warp_spec=use_warp_spec,
             use_tma=use_tma,
-            use_mbarrier=_config_bool(
-                config,
-                "use_mbarrier",
-                use_tma or use_warp_spec,
-                allow_none=True,
-            ),
+            smem_reuse_mode=SmemReuseMode(config.get("smem_reuse_mode", SmemReuseMode.ALL_STAGES)),
             _explicit_fields=frozenset(config),
         )
 
@@ -274,6 +280,7 @@ class _ResourceAnalysis:
 # Validate only invariants exercised by the migrated SM90 WGMMA policies.
 def get_problem_rejection_reasons(
     layer_config: LayerConfig,
+    mma_type: MmaType | None = None,
 ) -> tuple[str, ...]:
     reasons: list[str] = []
     input_group_size = layer_config.input_scale_group_size
@@ -281,7 +288,8 @@ def get_problem_rejection_reasons(
     if input_group_size and layer_config.shape_k != input_group_size and unpadded_shape_k % input_group_size:
         msg = f"unpadded shape_k={unpadded_shape_k} is not divisible by input scale group={input_group_size}"
         reasons.append(msg)
-    if layer_config.mma_type != MmaType.WGMMA:
+    mma_type = mma_type or get_default_mma_type(layer_config)
+    if mma_type != MmaType.WGMMA:
         return tuple(reasons)
     if layer_config.a_dtype.num_bits != 16 and layer_config.as_dtype != dtypes.float32:
         reasons.append(f"WGMMA input scales must use float32 storage, got {layer_config.as_dtype}")
@@ -308,6 +316,7 @@ def _analyze_geometry(
     layer_config: LayerConfig,
     block_shape: tuple[int, int, int],
     warp_shape: tuple[int, int, int],
+    mma_type: MmaType | None = None,
 ) -> _GeometryAnalysis:
     reasons: list[str] = []
     for name, shape in (("block_shape", block_shape), ("warp_shape", warp_shape)):
@@ -346,10 +355,18 @@ def _analyze_geometry(
     if warp_shape[1] < min_warp_n:
         reasons.append(f"warp_n={warp_shape[1]} is smaller than minimum {min_warp_n}")
     min_warp_k = {16: 32, 8: 64, 4: 128}[layer_config.a_dtype.num_bits]
+    if layer_config.use_packed_k_layout and warp_shape[2] != 128:
+        reasons.append("use_packed_k_layout requires warp_k=128")
     if warp_shape[2] < min_warp_k:
         reasons.append(f"warp_k={warp_shape[2]} is smaller than minimum {min_warp_k}")
 
-    if layer_config.mma_type == MmaType.WGMMA and ratios is not None:
+    mma_type = mma_type or get_default_mma_type(layer_config)
+    is_low_bit_mma = mma_type == MmaType.MMA and layer_config.a_dtype.num_bits < 16
+    has_regular_group_scales = layer_config.is_group_weight_scale and not layer_config.use_fused_e8m0_scale
+    uses_layout1 = has_regular_group_scales and not layer_config.should_apply_bs_on_c
+    if is_low_bit_mma and uses_layout1 and block_shape[1] < 64:
+        reasons.append("MMA group scales require block_n >= 64")
+    if mma_type == MmaType.WGMMA and ratios is not None:
         if ratios[1] % 4:
             reasons.append(
                 f"WGMMA requires the block-N tile to contain a multiple of four warp-N tiles: {ratios[1]}"
@@ -412,9 +429,17 @@ def _analyze_execution(
         reasons.append(f"num_threads={num_threads} exceeds the CTA limit 1024")
     if schedule.use_warp_spec and num_math_threads % 128:
         reasons.append(f"warp specialization requires a multiple of 128 math threads, got {num_math_threads}")
-    if (schedule.use_warp_spec or schedule.use_tma) and not schedule.use_mbarrier:
-        reasons.append("warp specialization and TMA require mbarrier synchronization")
-    if problem.layer_config.mma_type == MmaType.WGMMA and schedule.num_stages < 3:
+    mma_type = schedule.mma_type or get_default_mma_type(problem.layer_config)
+    if num_math_threads:
+        register_error = get_register_budget_error(
+            problem.layer_config,
+            schedule,
+            problem.use_f16_accum or schedule.use_f16_accum,
+            problem.device.max_registers_per_sm,
+        )
+        if register_error is not None:
+            reasons.append(register_error)
+    if mma_type == MmaType.WGMMA and schedule.num_stages < 3:
         reasons.append(f"WGMMA requires at least three stages, got {schedule.num_stages}")
 
     if schedule.multi_cast_size_a > 1:
@@ -444,11 +469,12 @@ def _analyze_resources(
         schedule.block_shape,
         problem.gemm_type,
         schedule.num_stages,
+        mma_type=schedule.mma_type or get_default_mma_type(problem.layer_config),
         warp_shape=schedule.warp_shape,
-        reduce_overlap_last_stage_only=False,
-        use_mbarrier=schedule.use_mbarrier,
+        smem_reuse_mode=schedule.smem_reuse_mode,
+        use_tma=schedule.use_tma,
         use_warp_spec=schedule.use_warp_spec,
-        num_write_splits=1,
+        output_chunk_rows=0,
         mma_accum_bits=16 if problem.use_f16_accum else 32,
     )
     if smem_size > problem.device.max_smem_size:
@@ -503,11 +529,12 @@ def analyze_candidate(
         problem.layer_config,
         candidate.block_shape,
         candidate.warp_shape,
+        candidate.mma_type,
     )
     execution = _analyze_execution(problem, candidate, geometry)
     resources = _analyze_resources(problem, candidate, execution)
     hard_violations = (
-        get_problem_rejection_reasons(problem.layer_config)
+        get_problem_rejection_reasons(problem.layer_config, candidate.mma_type)
         + geometry.rejection_reasons
         + _get_tile_rejection_reasons(problem, candidate)
         + execution.rejection_reasons
