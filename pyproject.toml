@@ -21,7 +21,7 @@ classifiers = [
 dependencies = [
     "torch>=2.7",
     "triton; sys_platform != 'win32'",
-    "triton-windows==3.6.0.post26; sys_platform == 'win32'",
+    "triton-windows==3.8.0.post29; sys_platform == 'win32'",
     "numpy",
     "safetensors",
     "jinja2",
