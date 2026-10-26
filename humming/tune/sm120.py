@@ -67,7 +67,7 @@ class Sm120Heuristics(Sm89Heuristics):
         )
 
     @classmethod
-    def _is_mxmma(cls, a_dtype, group_size, use_fused_e8m0_scale) -> bool:
+    def _has_group_fp_scales(cls, a_dtype, group_size, use_fused_e8m0_scale) -> bool:
         return (
             a_dtype.is_floating_point_type
             and a_dtype.num_bits <= 8
@@ -86,7 +86,7 @@ class Sm120Heuristics(Sm89Heuristics):
         gemm_type: GemmType,
         shape_k: int,
     ):
-        if cls._is_mxmma(a_dtype, group_size, use_fused_e8m0_scale):
+        if cls._has_group_fp_scales(a_dtype, group_size, use_fused_e8m0_scale):
             block_k = 512 // a_dtype.num_bits
             if a_dtype.num_bits == 8 and b_dtype.num_bits < a_dtype.num_bits:
                 return {
@@ -163,8 +163,11 @@ class Sm120Heuristics(Sm89Heuristics):
             cls._use_tma_b_only(config)
 
         group_size = layer_config.input_scale_group_size or layer_config.weight_scale_group_size
-        is_mxmma = cls._is_mxmma(layer_config.a_dtype, group_size, layer_config.use_fused_e8m0_scale)
-        if gemm_type != GemmType.INDEXED and is_mxmma:
+        has_group_fp_scales = cls._has_group_fp_scales(
+            layer_config.a_dtype, group_size, layer_config.use_fused_e8m0_scale
+        )
+        is_mxmma = has_group_fp_scales and get_default_mma_type(layer_config) == MmaType.MXMMA
+        if gemm_type != GemmType.INDEXED and has_group_fp_scales:
             num_stages = cls._fit_num_stages(layer_config, config, gemm_type, smem_reuse_mode="last_stage")
             config["num_stages"] = num_stages
             config["smem_reuse_mode"] = "last_stage"
@@ -214,7 +217,7 @@ class Sm120Heuristics(Sm89Heuristics):
                     config["use_warp_spec"] = False
 
             cls._rebalance_dense_warps(layer_config, config, shape_m)
-            if is_mxmma:
+            if has_group_fp_scales:
                 config["num_stages"] = min(
                     config["num_stages"],
                     cls._fit_num_stages(
@@ -225,7 +228,113 @@ class Sm120Heuristics(Sm89Heuristics):
                     ),
                 )
 
+        cls._tune_scaled_mma_pipeline(layer_config, config, gemm_type, use_m_major_input_scale)
+        cls._tune_small_tile_transfers(layer_config, config, gemm_type, shape_m)
         return config
+
+    @staticmethod
+    def _use_cp_async(config) -> None:
+        config.update(use_tma=False, use_warp_spec=False)
+        for key in [key for key in config if key.startswith("use_tma_")]:
+            config.pop(key)
+
+    @classmethod
+    def _tune_small_tile_transfers(cls, layer_config, config, gemm_type, shape_m) -> None:
+        block_m, block_n, block_k = config["block_shape"]
+        num_a_bits = layer_config.a_dtype.num_bits
+        num_b_bits = layer_config.b_dtype.num_bits
+        if gemm_type == GemmType.DENSE and shape_m <= block_m <= 16:
+            has_dequant_mainloop = num_a_bits < 16 and num_a_bits != num_b_bits
+            if not config["use_stream_k"] or not has_dequant_mainloop:
+                cls._use_cp_async(config)
+        elif gemm_type == GemmType.INDEXED:
+            has_small_weight_stage = block_m <= 16 and block_n * block_k * num_b_bits <= 32768
+            has_low_bit_weights = num_a_bits == 8 and num_b_bits <= 4 and block_m <= 64
+            if has_small_weight_stage or has_low_bit_weights:
+                cls._use_cp_async(config)
+
+    @classmethod
+    def _tune_scaled_mma_pipeline(cls, layer_config, config, gemm_type, use_m_major_input_scale) -> None:
+        mma_type = get_default_mma_type(layer_config)
+        block_m, block_n, block_k = config["block_shape"]
+        warp_m, warp_n, warp_k = config["warp_shape"]
+        original_stages = config["num_stages"]
+        is_mxfp8 = mma_type == MmaType.MXMMA and layer_config.a_dtype.num_bits == 8
+        is_mxfp8 &= layer_config.b_dtype.num_bits == 8
+        is_mxfp8 &= layer_config.is_group_input_scale or layer_config.is_group_weight_scale
+        should_refit = False
+        has_small_tile = block_m <= 32
+        can_use_scale_tma = use_m_major_input_scale and config.get("use_tma", False)
+        keep_scale_tma = can_use_scale_tma and gemm_type != GemmType.INDEXED and has_small_tile
+        if is_mxfp8 and not keep_scale_tma:
+            has_irregular_moe_tile = gemm_type != GemmType.DENSE and block_m < 64
+            if has_small_tile or has_irregular_moe_tile:
+                block_m = min(block_m, 32)
+                prefer_wide_tile = cls.sm_version == 120 and block_m >= 32 and gemm_type != GemmType.INDEXED
+                max_block_n = 128 if gemm_type == GemmType.DENSE or prefer_wide_tile else 64
+                block_n = min(block_n, max_block_n)
+                block_k = 256 if block_n == 64 else 128
+                warp_m, warp_n = 16, 32
+                k_warps = max(1, 4 // ((block_m // warp_m) * (block_n // warp_n)))
+                warp_k = block_k // k_warps
+                cls._use_cp_async(config)
+                config["num_stages"] = 3
+                should_refit = True
+            elif gemm_type == GemmType.INDEXED:
+                block_m, block_n, block_k = 64, min(block_n, 128), 128
+                warp_m, warp_n, warp_k = 32, 32, 128
+                cls._use_cp_async(config)
+                config["num_stages"] = 3
+                should_refit = True
+            elif block_k > warp_k:
+                block_m, block_n, block_k = 64, min(128, layer_config.shape_n), 64
+                warp_m, warp_n, warp_k = 32, 32, 64
+                config.update(use_tma=True, use_warp_spec=True, num_stages=4)
+                should_refit = True
+
+        has_software_group_scales = mma_type == MmaType.MMA and layer_config.a_dtype.num_bits == 8
+        has_software_group_scales &= layer_config.is_group_input_scale or layer_config.is_group_weight_scale
+        if has_software_group_scales and warp_m > 64:
+            block_m, block_n, block_k = 64, min(block_n, 128), min(block_k, 128)
+            warp_m, warp_n, warp_k = 32, min(warp_n, 32), block_k
+            cls._use_cp_async(config)
+            config["num_stages"] = min(config["num_stages"], 3)
+            should_refit = True
+
+        if should_refit:
+            while layer_config.shape_n % block_n:
+                block_n //= 2
+            while layer_config.shape_k % block_k:
+                block_k //= 2
+                warp_k = min(warp_k, block_k)
+            has_same_block = tuple(config["block_shape"]) == (block_m, block_n, block_k)
+            has_same_warp = tuple(config["warp_shape"]) == (warp_m, warp_n, warp_k)
+            if has_same_block and has_same_warp:
+                config["num_stages"] = min(config["num_stages"], original_stages)
+            config.update(block_shape=(block_m, block_n, block_k), warp_shape=(warp_m, warp_n, warp_k))
+            reuse_mode = config.get("smem_reuse_mode", "all_stages")
+            fitted_stages = cls._fit_num_stages(layer_config, config, gemm_type, reuse_mode)
+            config["num_stages"] = min(config["num_stages"], fitted_stages)
+            for num_stages in range(config["num_stages"], 1, -1):
+                smem = estimate_smem_size_layer(
+                    layer_config,
+                    config["block_shape"],
+                    gemm_type,
+                    num_stages,
+                    warp_shape=config["warp_shape"],
+                    smem_reuse_mode=reuse_mode,
+                    use_tma=config.get("use_tma", False),
+                    use_warp_spec=config.get("use_warp_spec", False),
+                    output_chunk_rows=config.get("output_chunk_rows", 0),
+                )
+                config["num_stages"] = num_stages
+                if smem * config["num_ctas_per_sm"] <= cls.max_smem_size:
+                    break
+            config["num_ctas_per_sm"] = min(config["num_ctas_per_sm"], cls.max_smem_size // smem)
+
+        has_long_warp_k = warp_m >= 32 and warp_k >= 256 and not config.get("use_warp_spec", False)
+        if has_long_warp_k and (is_mxfp8 or has_software_group_scales):
+            config.update(producer_stage_unroll=2, consumer_stage_unroll=2)
 
     @classmethod
     def _tune_small_m_dense(cls, layer_config, config, shape_m: int, is_wna16: bool) -> None:

@@ -5,7 +5,7 @@ from humming.config.mma import supports_undocumented_fp_dtypes, uses_undocumente
 from humming.device import current_device
 
 _OPERAND_DTYPE_MIN_SM = {
-    dtypes.int4: 80,
+    dtypes.int4: 75,
     dtypes.int8: 75,
     dtypes.float4e0m3: 120,
     dtypes.float4e2m1: 120,

@@ -13,7 +13,7 @@ CUDA_INLINE uint64_t make_wgmma_smem_desc(uint32_t addr) {
   constexpr uint64_t desc_base = (swizzle_type << 62) | (stride << 32);
 
   uint64_t desc = desc_base;
-  reinterpret_cast<uint32_t *>(&desc)[0] = (addr >> 4);
+  reinterpret_cast<uint32_t *>(&desc)[0] = (addr >> 4) & 0x3fff;
 
   return desc;
 };
@@ -81,9 +81,9 @@ public:
 
   CUDA_INLINE
   void transform_b(uint32_t buffer_id, uint32_t iter_id) {
-    if constexpr (Ctx::kUseRawWeight || std::is_same<ElementB, ElementQB>::value) return;
-
-    if constexpr (kUseFusedE8m0Scale) {
+    if constexpr (Ctx::kUseWgmmaSs || Ctx::kUseLdmatrixDequant) {
+      return;
+    } else if constexpr (kUseFusedE8m0Scale) {
       uint32_t *regs_b_ptr = reinterpret_cast<uint32_t *>(regs_b[buffer_id]);
       constexpr uint32_t kTransformIters = kUsePackedKLayout ? kNumKSlabs : WarpShape::N / 16;
       fused_dequant_for_mxfp4<ElementB, kTransformIters, true>(regs_qb[buffer_id], regs_b_ptr, arith.bs[buffer_id]);
@@ -129,6 +129,8 @@ public:
     uint32_t buffer_id = iter_id % 2;
 
     const uint32_t smem_base = cast_smem_ptr_to_uint(&ctx.smem);
+    const uint32_t stage_addr = smem_base + offsetof(SharedStorage, stages) + stage_id * sizeof(typename SharedStorage::StageStorage);
+    const uint64_t stage_desc = make_wgmma_smem_desc<kSwizzleBytes>(stage_addr + smem_offset);
     constexpr uint32_t kItersPerHalf = kUsePackedKLayout ? 1 : kWarpIters;
     constexpr uint32_t kNumIters = kUsePackedKLayout ? 1 : (WarpShape::N / (MmaShape::N / 4) / kPackedKFactor);
     constexpr uint32_t kRunKLoop = (kUsePackedKLayout || Ctx::kUseWgmmaSsKBatch) ? kNumKSlabs : kPackedKFactor;
@@ -142,9 +144,8 @@ public:
     PRAGMA_UNROLL
     for (uint32_t k = 0; k < kRunKLoop; k++) {
       uint32_t k_slab = (kUsePackedKLayout || Ctx::kUseWgmmaSsKBatch) ? k : ((iter_id % kItersPerHalf) * kPackedKFactor + k);
-      uint32_t smem_addr = smem_base + offsetof(SharedStorage, stages) + stage_id * sizeof(typename SharedStorage::StageStorage);
-      smem_addr += k_slab * 2 * sizeof(int4) + smem_offset;
-      uint64_t desc = make_wgmma_smem_desc<kSwizzleBytes>(smem_addr);
+      uint64_t desc = stage_desc;
+      reinterpret_cast<uint32_t *>(&desc)[0] += k_slab * 2;
 
       bool scale_d = true;
       if constexpr (ElementA::kBits != 16 && Ctx::kInputScaleGroupSize > 0) {
@@ -156,18 +157,18 @@ public:
 
       PRAGMA_UNROLL
       for (uint32_t j = 0; j < kNumIters; j++) {
-        if constexpr (Ctx::kUseRawWeight) {
-          constexpr uint32_t kSwizzleK = kSwizzleBytes * 8 / ElementQB::kBits;
+        if constexpr (Ctx::kUseWgmmaSs) {
+          static_assert(Ctx::kUseFlatWeight);
           uint32_t row = ctx.n_warp_id() / 4 * (WarpShape::N * 4) + j * MmaShape::N;
           if constexpr (Ctx::kUseWgmmaTmaNPermute) {
             constexpr uint32_t kFragmentPlaneRows = BlockShape::N / WarpShape::N * 16;
             row = ctx.n_warp_id() / 4 * MmaShape::N + j * kFragmentPlaneRows;
           }
           uint32_t col = ctx.k_warp_offset() + k_slab * kPartMmaShapeK;
-          uint32_t offset = (col / kSwizzleK * BlockShape::N + row) * kSwizzleBytes;
-          offset += col % kSwizzleK * ElementQB::kBits / 8;
-          uint32_t b_addr = cast_smem_ptr_to_uint(ctx.smem.stages[stage_id].b) + offset;
-          uint64_t b_desc = make_wgmma_smem_desc<kSwizzleBytes>(b_addr);
+          uint32_t offset = (col * ElementQB::kBits / 128 * BlockShape::N + row) * 16;
+          const uint32_t b_addr = stage_addr + offsetof(typename SharedStorage::StageStorage, b);
+          uint32_t b_start = ((b_addr + offset) >> 4) & 0x3fff;
+          uint64_t b_desc = b_start | (uint64_t(BlockShape::N) << 16) | (uint64_t(8) << 32);
           MmaOpClass::fma(desc, b_desc, regs_c[0][delta_j + j][0], scale_d);
         } else {
           MmaOpClass::fma(desc, regs_b[buffer_id][j][k], regs_c[0][delta_j + j][0], scale_d);
@@ -232,7 +233,7 @@ public:
 
   template <class T = uint32_t>
   CUDA_INLINE T *regs_qb_as_ptr(uint32_t buffer_id) {
-    if constexpr (std::is_same<ElementB, ElementQB>::value) {
+    if constexpr (Ctx::kUseLdmatrixDequant || std::is_same<ElementB, ElementQB>::value) {
       return reinterpret_cast<T *>(regs_b[buffer_id]);
     } else {
       return reinterpret_cast<T *>(regs_qb[buffer_id]);

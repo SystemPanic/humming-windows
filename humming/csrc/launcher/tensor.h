@@ -87,8 +87,8 @@ inline void check_tensor_b(Tensor &tensor, KernelData &kernel_data, int64_t dev)
 
   std::vector<int64_t> expected_shape = {};
   if (kernel_data.gemm_type_id != 0) expected_shape.push_back(kernel_data.num_experts);
-  if (kernel_data.use_raw_weight) {
-    if (get_dtype_num_bits(kernel_data.a_dtype_id) == 8 && num_bits < 8)
+  if (kernel_data.use_raw_weight || kernel_data.use_flat_weight) {
+    if (!kernel_data.use_ldmatrix_dequant && get_dtype_num_bits(kernel_data.a_dtype_id) == 8 && num_bits < 8)
       problem_shape_k = CEIL_DIV(problem_shape_k, 128) * 128;
     expected_shape.push_back(problem_shape_n);
     expected_shape.push_back(problem_shape_k * num_bits / 32);
@@ -252,10 +252,15 @@ inline void check_tensor_bs2(std::optional<Tensor> &tensor, KernelData &kernel_d
   }
 };
 
-inline void check_tensor_locks(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev) {
+inline void check_tensor_locks(std::optional<Tensor> &tensor, KernelData &kernel_data, int64_t dev, uint32_t num_ctas) {
   if (!kernel_data.use_stream_k) return;
   ASSERT_CHECK(tensor.has_value(), "locks must not be none if use_stream_k");
   check_tensor_common(tensor.value(), "locks", dev, ScalarType::Int);
+  const uint32_t cluster_size = kernel_data.multi_cast_size_a * kernel_data.multi_cast_size_b * kernel_data.umma_cta_group_size;
+  const uint32_t num_cta_groups = num_ctas / cluster_size;
+  const uint64_t max_stream_k_tiles = uint64_t(num_cta_groups + num_cta_groups / 10) * cluster_size;
+  const uint64_t required_locks = max_stream_k_tiles * kernel_data.num_stream_k_locks_per_tile;
+  ASSERT_CHECK(uint64_t(tensor->numel()) >= required_locks, "locks requires at least ", required_locks, " int32 elements, got ", tensor->numel());
 };
 
 inline void check_tensor_moe(
@@ -385,6 +390,25 @@ inline CUtensorMap make_tma_desc_b(Tensor &tensor, KernelData &kernel_data) {
   uint32_t block_shape_n = kernel_data.block_shape_n;
   uint32_t block_shape_k = kernel_data.block_shape_k;
 
+  if (kernel_data.use_flat_weight) {
+    CUtensorMap descriptor{};
+    bool use_wgmma_ss = kernel_data.mma_type == MmaType::WGMMA && !kernel_data.use_ldmatrix_dequant;
+    uint64_t warp_n = use_wgmma_ss ? kernel_data.warp_shape_n : 16;
+    uint64_t shape_n = kernel_data.problem_shape_n;
+    uint64_t num_experts = std::max(1u, kernel_data.num_experts);
+    uint64_t row_bytes = uint64_t(tensor.size(-1)) * 4;
+    uint64_t dimensions[] = {64, 64 / warp_n, shape_n / 64, warp_n / 16, row_bytes / 16 * num_experts};
+    uint64_t strides[] = {warp_n * 16, 1024, 256, shape_n * 16};
+    uint32_t box[] = {64, uint32_t(std::min(64u, block_shape_n) / warp_n),
+        (block_shape_n + 63) / 64, uint32_t(warp_n / 16), block_shape_k * num_bits / 128};
+    uint32_t element_strides[] = {1, 1, 1, 1, 1};
+    CUresult status = cuTensorMapEncodeTiled(&descriptor, CU_TENSOR_MAP_DATA_TYPE_INT32, 5,
+        tensor.data_ptr(), dimensions, strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    ASSERT_CHECK(status == CUDA_SUCCESS, "TMA Encode Failed for flat weights: ", int(status));
+    return descriptor;
+  }
+
   if (kernel_data.use_raw_weight) {
     // FP4/FP6 in an f8f6f4 instruction uses padded 16-element blocks in SMEM.
     bool expand_low_bit = num_bits < 8 && get_dtype_num_bits(kernel_data.a_dtype_id) == 8;
@@ -403,25 +427,6 @@ inline CUtensorMap make_tma_desc_b(Tensor &tensor, KernelData &kernel_data) {
       ASSERT_CHECK(status == CUDA_SUCCESS, "TMA Encode Failed for expanded low-bit weights");
       return descriptor;
     }
-    if (kernel_data.mma_type == MmaType::WGMMA) {
-      CUtensorMap descriptor{};
-      uint64_t w = kernel_data.warp_shape_n;
-      uint64_t row_bytes = uint64_t(tensor.size(-1)) * 4;
-      // Fragment planes span all N warps in the CTA, leaving the fifth
-      // dimension available for K slabs even with multiple N warpgroups.
-      uint64_t dimensions[] = {swizzle_bytes / 4, 16,
-          uint64_t(kernel_data.problem_shape_n) * std::max(1u, kernel_data.num_experts) / w,
-          w / 16, row_bytes / swizzle_bytes};
-      uint64_t strides[] = {row_bytes, w * row_bytes, 16 * row_bytes, swizzle_bytes};
-      uint32_t box[] = {swizzle_bytes / 4, 16, uint32_t(block_shape_n / w), uint32_t(w / 16),
-          block_shape_k * num_bits / 8 / swizzle_bytes};
-      uint32_t element_strides[] = {1, 1, 1, 1, 1};
-      CUresult status = cuTensorMapEncodeTiled(&descriptor, CU_TENSOR_MAP_DATA_TYPE_INT32, 5,
-          tensor.data_ptr(), dimensions, strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-          get_swizzle_enum(swizzle_bytes), CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      ASSERT_CHECK(status == CUDA_SUCCESS, "TMA Encode Failed for WGMMA N permutation: ", int(status));
-      return descriptor;
-    }
     auto rows = torch_view_shape(tensor, {-1, tensor.size(-1)});
     return make_tma_desc(rows, {swizzle_bytes / 4, std::min(256u, kernel_data.use_umma_ss ? std::max(128u, block_shape_n) : block_shape_n)}, swizzle_bytes, "b");
   }
@@ -438,11 +443,10 @@ inline CUtensorMap make_tma_desc_b(Tensor &tensor, KernelData &kernel_data) {
 inline CUtensorMap make_tma_desc_c(Tensor tensor, KernelData &kernel_data) {
   if (!kernel_data.use_tma_c) return CUtensorMap();
   tensor = torch_view_shape(tensor, {-1, tensor.size(-1)});
-  uint32_t rows = kernel_data.output_chunk_rows ? std::min(kernel_data.output_chunk_rows, kernel_data.block_shape_m) : kernel_data.block_shape_m;
+  const uint32_t rows = kernel_data.output_tile_rows;
   if (tensor.size(-1) % 64 != 0) return make_tma_desc(tensor, {64, rows}, 128, "c");
 
-  uint32_t columns = kernel_data.block_shape_n;
-  if (kernel_data.mma_type == MmaType::UMMA && kernel_data.output_chunk_rows) columns = 128;
+  const uint32_t columns = kernel_data.output_tile_columns;
   CUtensorMap descriptor = {};
   uint64_t dimensions[] = {64, uint64_t(tensor.size(0)), uint64_t(tensor.size(1) / 64)};
   uint64_t strides[] = {uint64_t(tensor.size(1) * 2), 128};

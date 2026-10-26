@@ -17,6 +17,8 @@ MODES = (
     "mma_e0m3_ab",
     "cvt_e3m4",
     "cvt_e0m3",
+    "ldmatrix_s4_s8",
+    "ldmatrix_s2_s4",
 )
 
 _RC_MESSAGE = {
@@ -27,6 +29,10 @@ _RC_MESSAGE = {
 }
 
 _cached_lib = None
+
+
+def is_cubin_patch_enabled() -> bool:
+    return os.environ.get("HUMMING_DISABLE_PATCH_CUBIN", "0") != "1"
 
 
 def get_cubin_kernel_names(path: str | os.PathLike) -> list[str]:
@@ -147,6 +153,8 @@ def may_build_cubin_patcher():
 
 
 def patch_cubin(cubin_path, mode, dry_run=False, backup=False):
+    if not is_cubin_patch_enabled():
+        raise RuntimeError("CUBIN patching is disabled by HUMMING_DISABLE_PATCH_CUBIN=1")
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}; expected one of {list(MODES)}")
     if not os.path.exists(cubin_path):
@@ -168,6 +176,8 @@ def patch_cubin(cubin_path, mode, dry_run=False, backup=False):
 
 
 def patch_cubin_bytes(data, mode, dry_run=False):
+    if not is_cubin_patch_enabled():
+        raise RuntimeError("CUBIN patching is disabled by HUMMING_DISABLE_PATCH_CUBIN=1")
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}; expected one of {list(MODES)}")
 
@@ -184,6 +194,8 @@ def patch_cubin_bytes(data, mode, dry_run=False):
 
 
 def patch_triton_compiled_kernel(compiled_kernel, mode):
+    if not is_cubin_patch_enabled():
+        raise RuntimeError("CUBIN patching is disabled by HUMMING_DISABLE_PATCH_CUBIN=1")
     ck = compiled_kernel
     if getattr(ck, "module", None) is not None:
         return 0

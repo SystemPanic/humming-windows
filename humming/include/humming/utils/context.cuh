@@ -59,9 +59,8 @@ struct KernelContext : LayerConfig_, ComputeConfig_, TuningConfig_ {
   static constexpr bool kUseWgmma = TuningConfig::kMmaType == MmaType::WGMMA;
   static constexpr bool kUseCpAsync = LayerConfig::kSmVersion >= 80;
   static constexpr bool kUseMBarrier = kUseUmma || TuningConfig::kUseWarpSpec || TuningConfig::kUseTma;
-  static constexpr bool kUseWgmmaSs = kUseWgmma && LayerConfig::kUseRawWeight;
+  static constexpr bool kUseWgmmaSs = kUseWgmma && std::is_same<ElementB, ElementQB>::value;
   static constexpr bool kUseWgmmaTmaNPermute = kUseWgmmaSs && TuningConfig::kUseTmaB;
-  static constexpr bool kUseWgmmaTmaKPack = kUseWgmmaTmaNPermute;
   static constexpr bool kUseWgmmaTmaAPack = kUseWgmma && TuningConfig::kUseTmaA && ElementA::kBits >= 8 && !kIsIndexedGemm &&
       (ProblemShape::K - PadShape::K) * ElementA::kBits % 1024 == 0 && BlockShape::K * ElementA::kBits > 1024;
   static constexpr bool kUseWgmmaCpAsyncNPermute = kUseWgmmaSs && !TuningConfig::kUseTmaB && WarpShape::N > 16;

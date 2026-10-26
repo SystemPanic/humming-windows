@@ -8,6 +8,7 @@ class Sm75Heuristics(DeviceHeuristics):
     sm_version: int = 75
     b16_allowed_dtypes: list[dtypes.DataType] = [dtypes.float16]
     b8_allowed_dtypes: list[dtypes.DataType] = [dtypes.int8]
+    b4_allowed_dtypes: list[dtypes.DataType] = [dtypes.int4]
 
     @classmethod
     def get_base_config(
@@ -20,6 +21,7 @@ class Sm75Heuristics(DeviceHeuristics):
         gemm_type: GemmType,
         shape_k: int,
     ):
+        warp_shape_k = 512 // a_dtype.num_bits
         if a_dtype.num_bits == 16:
             warp_shape_k = 64 if b_dtype.num_bits <= 3 else 32
             return {
@@ -30,24 +32,25 @@ class Sm75Heuristics(DeviceHeuristics):
             }
         elif group_size == 0 and b_dtype.num_bits <= 5:
             return {
-                "block_shape": (64, 256, 64),
-                "warp_shape": (64, 64, 64),
+                "block_shape": (64, 256, warp_shape_k),
+                "warp_shape": (64, 64, warp_shape_k),
                 "num_ctas_per_sm": 2,
                 "output_chunk_rows": 32,
             }
         elif group_size == 0 and gemm_type != GemmType.DENSE:
             return {
-                "block_shape": (128, 256, 64),
-                "warp_shape": (64, 64, 64),
+                "block_shape": (128, 256, warp_shape_k),
+                "warp_shape": (64, 64, warp_shape_k),
             }
         elif group_size == 0:
             return {
-                "block_shape": (128, 256, 64),
-                "warp_shape": (128, 32, 64),
+                "block_shape": (128, 256, warp_shape_k),
+                "warp_shape": (128, 32, warp_shape_k),
                 "output_chunk_rows": 64,
             }
         else:
-            warp_shape_k = 128 if b_dtype.num_bits <= 5 else 64
+            if b_dtype.num_bits <= 5:
+                warp_shape_k *= 2
             return {
                 "block_shape": (64, 256, warp_shape_k),
                 "warp_shape": (64, 32, warp_shape_k),

@@ -13,7 +13,9 @@ from humming.config import (
 from humming.config import (
     ProcessInputQuantizationPhase as QuantizationPhase,
 )
+from humming.config.mma import UNDOCUMENTED_FP_DTYPES
 from humming.jit.runtime import KernelRuntime
+from humming.utils.cubin import is_cubin_patch_enabled
 
 _SOURCE_TYPE_CPP = {
     dtypes.float16: "__half",
@@ -99,6 +101,8 @@ class ProcessInputKernel(KernelRuntime, ProcessInputProblemConfig, ProcessInputT
         self.kernel_name = kernel_name
 
     def init_kernel(self):
+        if self.quant_dtype in UNDOCUMENTED_FP_DTYPES and not is_cubin_patch_enabled():
+            raise ValueError(f"{self.quant_dtype} is disabled by HUMMING_DISABLE_PATCH_CUBIN=1")
         is_finalizer = isinstance(self, ProcessInputScaleKernel)
         if is_finalizer:
             assert self.quant_mode == InputQuantizationMode.DynamicGroupToken

@@ -1,18 +1,25 @@
+from enum import Enum
+
 from humming import dtypes
-from humming.config import GemmType, LayerConfig
+from humming.config import GemmType, LayerConfig, MmaType
 from humming.device import current_device
 from humming.tune.candidate import (
     DeviceProfile,
+    ScheduleCandidate,
     TuningDecision,
     TuningProblem,
+    analyze_candidate,
 )
 from humming.tune.sm8x import Sm80Heuristics
 from humming.tune.sm90_policies import (
     Sm90CandidatePolicy,
     build_sm90_seed_config,
     calc_sm90_num_block_list,
+    fit_sm90_tile,
+    get_compact_moe_config,
+    get_sm90_specialized_config,
     select_grouped_scale,
-    select_indexed_a16,
+    select_moe_a16,
 )
 from humming.utils.smem import estimate_smem_size_layer
 
@@ -48,6 +55,7 @@ class Sm90Heuristics(Sm80Heuristics):
         gemm_type: GemmType,
         *,
         include_grid_size: bool = False,
+        use_m_major_input_scale: bool = False,
     ) -> TuningProblem:
         return TuningProblem(
             layer_config=layer_config,
@@ -56,18 +64,18 @@ class Sm90Heuristics(Sm80Heuristics):
             device=cls.get_device_profile(include_grid_size=include_grid_size),
             use_f16_accum=use_f16_accum,
             use_batch_invariant=use_batch_invariant,
+            use_m_major_input_scale=use_m_major_input_scale,
+            expert_probability_cv=cls.expert_probability_cv,
         )
 
     @classmethod
-    def _uses_indexed_a16_policy(
+    def _uses_moe_a16_policy(
         cls,
         layer_config: LayerConfig,
         use_batch_invariant: bool,
         gemm_type: GemmType,
     ) -> bool:
-        return (
-            gemm_type == GemmType.INDEXED and layer_config.a_dtype.num_bits == 16 and not use_batch_invariant
-        )
+        return gemm_type != GemmType.DENSE and layer_config.a_dtype.num_bits == 16 and not use_batch_invariant
 
     @classmethod
     def get_config1(
@@ -112,7 +120,9 @@ class Sm90Heuristics(Sm80Heuristics):
         shape_m: int,
         max_block_m: int,
     ):
-        return calc_sm90_num_block_list(layer_config, shape_m, max_block_m)
+        return calc_sm90_num_block_list(
+            layer_config, shape_m, max_block_m, expert_probability_cv=cls.expert_probability_cv
+        )
 
     @classmethod
     def _uses_grouped_scale_candidates(
@@ -128,15 +138,16 @@ class Sm90Heuristics(Sm80Heuristics):
         return not (layer_config.use_fused_e8m0_scale and layer_config.input_scale_group_size == 0)
 
     @classmethod
-    def get_tuning_decision(
+    def _get_candidate_decision(
         cls,
         layer_config: LayerConfig,
         shape_m: int,
         use_f16_accum: bool = False,
         use_batch_invariant: bool = False,
         gemm_type: GemmType = GemmType.DENSE,
+        use_m_major_input_scale: bool = False,
     ) -> TuningDecision:
-        tune_indexed_a16 = cls._uses_indexed_a16_policy(
+        tune_moe_a16 = cls._uses_moe_a16_policy(
             layer_config,
             use_batch_invariant,
             gemm_type,
@@ -147,19 +158,20 @@ class Sm90Heuristics(Sm80Heuristics):
             use_f16_accum,
             use_batch_invariant,
             gemm_type,
-            include_grid_size=tune_indexed_a16,
+            include_grid_size=gemm_type != GemmType.DENSE,
+            use_m_major_input_scale=use_m_major_input_scale,
         )
         if cls._uses_grouped_scale_candidates(layer_config):
             return select_grouped_scale(problem)
-        if not tune_indexed_a16:
+        if not tune_moe_a16:
             raise ValueError("decision traces are only available for migrated SM90 policies")
-        return select_indexed_a16(
+        return select_moe_a16(
             problem,
             cls.candidate_policy,
         )
 
     @classmethod
-    def get_config(
+    def _select_config(
         cls,
         layer_config: LayerConfig,
         shape_m: int,
@@ -168,22 +180,54 @@ class Sm90Heuristics(Sm80Heuristics):
         gemm_type: GemmType = GemmType.DENSE,
         use_m_major_input_scale: bool = False,
     ):
+        shape_m = cls.get_shape_m_sample(layer_config, shape_m)
+        specialized_config = get_sm90_specialized_config(
+            layer_config,
+            shape_m,
+            gemm_type,
+            use_f16_accum,
+            use_batch_invariant,
+            use_m_major_input_scale=use_m_major_input_scale,
+            expert_probability_cv=cls.expert_probability_cv,
+        )
+        if specialized_config is not None:
+            return specialized_config
+
+        is_wna16 = layer_config.a_dtype.num_bits == 16 and layer_config.b_dtype.num_bits < 16
+        has_short_reduction = shape_m <= 32 and layer_config.shape_k <= 1024
+        is_tile_aligned = layer_config.shape_n % 128 == 0 and layer_config.shape_k % 64 == 0
+        can_use_small_mma = gemm_type == GemmType.DENSE and not use_f16_accum and not use_batch_invariant
+        if is_wna16 and has_short_reduction and is_tile_aligned and can_use_small_mma:
+            # A short reduction cannot amortize a producer warpgroup or Stream-K
+            # fixups. Two K warps let MMA dequantize while keeping the M tile small.
+            return {
+                "mma_type": MmaType.MMA.value,
+                "block_shape": (16, 128, 64),
+                "warp_shape": (16, 32, 32),
+                "num_stages": 4,
+                "num_ctas_per_sm": 1,
+                "use_stream_k": False,
+                "use_tma": False,
+                "use_warp_spec": False,
+            }
+
         if layer_config.a_dtype == dtypes.int4:
             return super().get_config(
                 layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type, use_m_major_input_scale
             )
 
         use_grouped_scale_candidates = cls._uses_grouped_scale_candidates(layer_config)
-        use_indexed_a16_policy = cls._uses_indexed_a16_policy(layer_config, use_batch_invariant, gemm_type)
-        use_candidates = use_grouped_scale_candidates or use_indexed_a16_policy
+        use_moe_a16_policy = cls._uses_moe_a16_policy(layer_config, use_batch_invariant, gemm_type)
+        use_candidates = use_grouped_scale_candidates or use_moe_a16_policy
         if use_candidates:
-            return cls.get_tuning_decision(
+            return cls._get_candidate_decision(
                 layer_config,
                 shape_m,
                 use_f16_accum,
                 use_batch_invariant,
                 gemm_type,
-            ).to_config()
+                use_m_major_input_scale,
+            )
 
         config = cls.get_config1(
             layer_config,
@@ -209,3 +253,85 @@ class Sm90Heuristics(Sm80Heuristics):
                 break
             config["num_stages"] -= 1
         return config
+
+    @classmethod
+    def get_config(
+        cls,
+        layer_config: LayerConfig,
+        shape_m: int,
+        use_f16_accum: bool = False,
+        use_batch_invariant: bool = False,
+        gemm_type: GemmType = GemmType.DENSE,
+        use_m_major_input_scale: bool = False,
+    ):
+        selected = cls._select_config(
+            layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type, use_m_major_input_scale
+        )
+        config = selected.to_config() if isinstance(selected, TuningDecision) else selected
+        config = fit_sm90_tile(
+            layer_config,
+            config,
+            use_f16_accum,
+            gemm_type=gemm_type,
+            use_m_major_input_scale=use_m_major_input_scale,
+        )
+        config = get_compact_moe_config(
+            layer_config,
+            config,
+            gemm_type,
+            use_f16_accum,
+            use_batch_invariant,
+            use_m_major_input_scale=use_m_major_input_scale,
+        )
+        return {key: value.value if isinstance(value, Enum) else value for key, value in config.items()}
+
+    @classmethod
+    def get_tuning_decision(
+        cls,
+        layer_config: LayerConfig,
+        shape_m: int,
+        use_f16_accum: bool = False,
+        use_batch_invariant: bool = False,
+        gemm_type: GemmType = GemmType.DENSE,
+        use_m_major_input_scale: bool = False,
+    ) -> TuningDecision:
+        selected = cls._select_config(
+            layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type, use_m_major_input_scale
+        )
+        decision = selected if isinstance(selected, TuningDecision) else None
+        config = decision.to_config() if decision is not None else selected
+        fitted = fit_sm90_tile(
+            layer_config,
+            config,
+            use_f16_accum,
+            gemm_type=gemm_type,
+            use_m_major_input_scale=use_m_major_input_scale,
+        )
+        fitted = get_compact_moe_config(
+            layer_config,
+            fitted,
+            gemm_type,
+            use_f16_accum,
+            use_batch_invariant,
+            use_m_major_input_scale=use_m_major_input_scale,
+        )
+        if decision is not None and fitted == config:
+            return decision
+        problem = cls._make_problem(
+            layer_config,
+            cls.get_shape_m_sample(layer_config, shape_m),
+            use_f16_accum,
+            use_batch_invariant,
+            gemm_type,
+            include_grid_size=True,
+            use_m_major_input_scale=use_m_major_input_scale,
+        )
+        candidate = ScheduleCandidate.from_config("sm90_selected", fitted)
+        analysis = analyze_candidate(problem, candidate)
+        return TuningDecision(
+            problem=problem,
+            family="sm90",
+            selected=candidate,
+            considered=(*decision.considered, analysis) if decision is not None else (analysis,),
+            reason="selected by the runtime SM90 configuration policy",
+        )

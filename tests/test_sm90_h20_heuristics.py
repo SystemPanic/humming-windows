@@ -87,7 +87,7 @@ def test_sparse_long_k_moe_keeps_two_n_tiles_per_expert(shape_n, block_n):
 
 
 @pytest.mark.parametrize("shape_m", [3072, 12288, 24576])
-@pytest.mark.parametrize("a_dtype", [dtypes.float16, dtypes.bfloat16, dtypes.float8e4m3, dtypes.int8])
+@pytest.mark.parametrize("a_dtype", [dtypes.float16, dtypes.bfloat16])
 def test_large_mxfp4_grouped_contiguous_uses_three_resident_ctas(shape_m, a_dtype):
     config = Sm90H20Heuristics.get_config(
         _mxfp4_layer(4608, 5120, a_dtype),

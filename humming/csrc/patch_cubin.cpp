@@ -52,7 +52,9 @@ enum Kind {
   K_MMA_E3M4,
   K_MMA_E0M3,
   K_CVT_E3M4,
-  K_CVT_E0M3
+  K_CVT_E0M3,
+  K_LDMATRIX_S4_S8,
+  K_LDMATRIX_S2_S4
 };
 
 struct Mode {
@@ -70,6 +72,8 @@ static const Mode MODES[] = {
     {"mma_e0m3_ab", K_MMA_E0M3, true, true},
     {"cvt_e3m4", K_CVT_E3M4, true, true},
     {"cvt_e0m3", K_CVT_E0M3, true, true},
+    {"ldmatrix_s4_s8", K_LDMATRIX_S4_S8, false, false},
+    {"ldmatrix_s2_s4", K_LDMATRIX_S2_S4, false, false},
 };
 
 struct Sec {
@@ -102,10 +106,7 @@ static T rd(const std::vector<uint8_t> &d, size_t o) {
   return v;
 }
 
-// Accept EM_CUDA (0xBE), SM120/121 and SM100/103 for conversion patches. The cubin e_flags are
-// identical for sm_120 / sm_120a / sm_120f (0x06007802), so the a/f suffix
-// cannot be told apart at the ELF level; block-scaled MMA only builds for
-// architecture-specific or family-specific targets anyway.
+// CUDA cubin flags do not distinguish the a/f target suffixes.
 static int check_arch(const std::vector<uint8_t> &d, const Mode &mode, std::string &why) {
   if (d.size() < 64 || d[0] != 0x7f || d[1] != 'E' || d[2] != 'L' || d[3] != 'F') {
     why = "not an ELF/cubin";
@@ -123,10 +124,13 @@ static int check_arch(const std::vector<uint8_t> &d, const Mode &mode, std::stri
     why = b;
     return 1;
   }
-  uint32_t sm = (eflags >> 8) & 0xff;
+  uint32_t sm = eflags & 0xff;
+  if (sm < 75) sm = (eflags >> 8) & 0xff;
   bool is_cvt = mode.kind == K_CVT_E3M4 || mode.kind == K_CVT_E0M3;
   bool is_sm10x_cvt = (sm == 100 || sm == 103) && is_cvt;
-  if (sm != 120 && sm != 121 && !is_sm10x_cvt) {
+  bool is_ldmatrix = mode.kind == K_LDMATRIX_S4_S8 || mode.kind == K_LDMATRIX_S2_S4;
+  bool supports_ldmatrix = is_ldmatrix && sm >= 75;
+  if (sm != 120 && sm != 121 && !is_sm10x_cvt && !supports_ldmatrix) {
     char b[128];
     snprintf(b, sizeof(b), "target arch SM=%u (e_flags=0x%08x) does not support patch mode %s", sm, eflags, mode.name);
     why = b;
@@ -164,6 +168,21 @@ static void collect_exec_sections(const std::vector<uint8_t> &d, std::vector<Sec
 static int handle(std::vector<uint8_t> &d, size_t o, const Mode &m, bool dry, std::string &reason) {
   uint32_t op = opcode12(d, o);
   char buf[160];
+
+  if (m.kind == K_LDMATRIX_S4_S8 || m.kind == K_LDMATRIX_S2_S4) {
+    if (op != 0x83b) return -1;
+    uint64_t high = rd<uint64_t>(d, o + 8);
+    constexpr uint64_t format_mask = (7ull << 11) | (7ull << 14);
+    if ((high & format_mask) != (1ull << 14)) return 0;
+    uint32_t matrix_count_log2 = (high >> 8) & 3;
+    if (matrix_count_log2 != 1 && matrix_count_log2 != 2) return 0;
+    bool is_s4 = m.kind == K_LDMATRIX_S4_S8;
+    high &= ~format_mask;
+    high |= (uint64_t(is_s4 ? 2 : 4) << 11) | (uint64_t(is_s4 ? 2 : 3) << 14);
+    if (!dry) memcpy(d.data() + o + 8, &high, sizeof(high));
+    reason = is_s4 ? "S4->S8" : "S2->S4";
+    return 1;
+  }
 
   if (m.kind == K_MMA_E0M3) {
     if (op != 0x47f) return -1; // OMMA

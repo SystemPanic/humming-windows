@@ -62,7 +62,7 @@ public:
   }
 
   CUDA_INLINE
-  void load_raw(const int4 *smem_ptr, uint32_t *regs_ptr, uint32_t iter_id) {
+  void load_native(const int4 *smem_ptr, uint32_t *regs_ptr, uint32_t iter_id) {
     if constexpr (USE_PPU && Ctx::kUseCpAsync && !Ctx::kUseTmaB)
       return load_raw_aiu(smem_ptr, regs_ptr, iter_id);
     constexpr uint32_t kSwizzleInt4s = MIN(8u, BlockShape::K * ElementQB::kBits / 128);
@@ -76,6 +76,7 @@ public:
       uint32_t col = (ctx.k_warp_offset() * ElementQB::kBits / 256 + iter_id) * 2 + (lane_id / 8) % 2;
       uint32_t offset = (col / kSwizzleInt4s * BlockShape::N + row) * kSwizzleInt4s + col % kSwizzleInt4s;
       uint32_t swizzled_offset = offset ^ ((smem_base + offset / 8) % kSwizzleInt4s);
+      if constexpr (Ctx::kUseFlatWeight) swizzled_offset = col * BlockShape::N + row;
       ld_shared<kRowsPerLoad / 4>(smem_ptr + swizzled_offset, reinterpret_cast<int4 *>(regs_ptr + n * kRowsPerLoad / 4));
     }
   }
@@ -93,8 +94,27 @@ public:
   }
 
   CUDA_INLINE
+  void load_dequant(const int4 *smem_ptr, uint32_t *regs_ptr, uint32_t iter_id) {
+    constexpr uint32_t kSwizzleInt4s = MIN(8u, BlockShape::K * ElementQB::kBits / 128);
+    constexpr uint32_t kRowsPerLoad = Ctx::kUseWgmma ? 16 : 8;
+    uint32_t smem_base = cast_smem_ptr_to_uint(smem_ptr);
+    uint32_t lane_id = ctx.lane_id();
+    uint32_t col = ctx.k_warp_offset() * ElementQB::kBits / 128 + iter_id;
+    uint32_t half = lane_id / kRowsPerLoad % 2;
+    PRAGMA_UNROLL
+    for (uint32_t n = 0; n < WarpShape::N / kRowsPerLoad; ++n) {
+      uint32_t row = ctx.n_warp_offset() + n * kRowsPerLoad + lane_id % kRowsPerLoad;
+      uint32_t offset = (col / kSwizzleInt4s * BlockShape::N + row) * kSwizzleInt4s + col % kSwizzleInt4s;
+      offset ^= (smem_base / 128 + offset / 8) % kSwizzleInt4s;
+      if constexpr (Ctx::kUseFlatWeight) offset = col * BlockShape::N + row;
+      ld_shared_dequant<ElementQB::kBits, kRowsPerLoad / 4>(smem_base + offset * 16 + half * 8, regs_ptr + n * kRowsPerLoad / 4);
+    }
+  }
+
+  CUDA_INLINE
   void load(const int4 *smem_ptr, uint32_t *regs_ptr, uint32_t iter_id) {
-    if constexpr (Ctx::kUseRawWeight) return load_raw(smem_ptr, regs_ptr, iter_id);
+    if constexpr (Ctx::kUseLdmatrixDequant) return load_dequant(smem_ptr, regs_ptr, iter_id);
+    if constexpr (Ctx::kUseRawWeight || Ctx::kUseFlatWeight) return load_native(smem_ptr, regs_ptr, iter_id);
     if constexpr (Ctx::kUsePackedKLayout) return load_packed_k(smem_ptr, regs_ptr, iter_id);
     uint32_t warp_id = ctx.warp_id();
     uint32_t n_warp_id = ctx.n_warp_id();

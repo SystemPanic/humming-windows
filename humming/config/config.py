@@ -18,6 +18,7 @@ from humming.config.enum import (
     WeightScaleType,
 )
 from humming.device import DeviceInfo, current_device
+from humming.utils.cubin import is_cubin_patch_enabled
 from humming.utils.math import round_up
 
 
@@ -80,6 +81,8 @@ class LayerConfig(BaseHummingConfig):
         "is_token_input_scale_2",
         "is_tensor_input_scale_2",
         "use_raw_weight",
+        "use_flat_weight",
+        "use_ldmatrix_dequant",
         "use_native_dequant",
         "use_block_scaled_mma",
         "mma_scale_group_size",
@@ -130,9 +133,25 @@ class LayerConfig(BaseHummingConfig):
         return use_f16_umma or use_fp8_umma or use_fp4_umma or use_int8_umma
 
     @property
+    def use_ldmatrix_dequant(self):
+        has_int4_weight = self.a_dtype == dtypes.int8 and self.b_dtype in (dtypes.int4, dtypes.uint4)
+        has_int2_weight = self.a_dtype == dtypes.int4 and self.b_dtype in (dtypes.int2, dtypes.uint2)
+        has_supported_device = self.sm_version >= 75 and not current_device.is_ppu
+        if not has_supported_device or self.has_zero_point or not (has_int4_weight or has_int2_weight):
+            return False
+        if is_cubin_patch_enabled():
+            return True
+        if not has_int4_weight or self.sm_version < 90:
+            return False
+
+        from humming.jit.runtime import KernelRuntime
+
+        return _cuda_compiler_version(KernelRuntime._get_compiler()) >= (13, 4)
+
+    @property
     def use_raw_weight(self):
         if self.a_dtype.num_bits == self.b_dtype.num_bits:
-            return True
+            return self.is_umma_supported or current_device.is_ppu
         has_native_mixed_activation = self.a_dtype in (
             dtypes.float8e4m3,
             dtypes.float8e5m2,
@@ -144,6 +163,13 @@ class LayerConfig(BaseHummingConfig):
             dtypes.float6e2m3,
         )
         return has_native_mixed_activation and has_native_mixed_weight and self.is_umma_supported
+
+    @property
+    def use_flat_weight(self):
+        if self.use_ldmatrix_dequant:
+            return True
+        has_same_width = self.a_dtype.num_bits == self.b_dtype.num_bits
+        return has_same_width and not self.is_umma_supported and not current_device.is_ppu
 
     @property
     def use_block_scaled_mma(self):
@@ -168,7 +194,7 @@ class LayerConfig(BaseHummingConfig):
     @property
     def use_native_dequant(self):
         assert self.sm_version is not None
-        if self.use_raw_weight or self.sm_version // 10 == 9:
+        if self.use_raw_weight or self.use_flat_weight or self.sm_version // 10 == 9:
             return False
 
         from humming.jit.runtime import KernelRuntime
@@ -379,19 +405,20 @@ class LayerConfig(BaseHummingConfig):
             can_use_packed_k = (
                 self.sm_version // 10 == 9
                 and not self.use_raw_weight
+                and not self.use_flat_weight
                 and has_packed_k_operands
                 and has_packed_k_input_scale
             )
             if self.use_fused_e8m0_scale:
-                prefer_packed_k = (
-                    self.num_experts > 0 and self.input_scale_group_size >= 128 and self.shape_n % 64 == 0
-                )
+                prefer_packed_k = self.input_scale_group_size >= 128 and self.shape_n % 64 == 0
             else:
                 prefer_packed_k = self.weight_scale_group_size == 128
             self.use_packed_k_layout = can_use_packed_k and prefer_packed_k
         elif self.use_packed_k_layout:
             assert self.sm_version // 10 == 9, "use_packed_k_layout requires SM90"
-            assert not self.use_raw_weight, "raw weights do not use packed-K layout"
+            assert not (self.use_raw_weight or self.use_flat_weight), (
+                "raw/flat weights do not use packed-K layout"
+            )
             assert self.a_dtype.num_bits == 8, "use_packed_k_layout requires 8-bit activation"
             assert self.b_dtype.num_bits % 2 == 0, "use_packed_k_layout requires even-bit weight"
 
@@ -501,11 +528,13 @@ class TuningConfig(BaseHummingConfig):
 
     use_stream_k: bool = True
 
-    # WGMMA mainloop scheduling; independent of the packed weight layout.
     wgmma_use_late_as: bool = False
     wgmma_split_issue_wait: bool = False
 
     num_stages: int = 2
+    producer_stage_unroll: int | None = None
+    consumer_stage_unroll: int | None = None
+    producer_registers: int | None = None
     num_ctas_per_sm: int = 1
     umma_num_dequant_warpgroups: int = 1
     umma_cta_group_size: int = 1
@@ -538,6 +567,7 @@ class TuningConfig(BaseHummingConfig):
         "num_threads",
         "num_math_threads",
         "num_load_threads",
+        "consumer_registers",
         "smem_reuse_mode_id",
     )
 
@@ -583,6 +613,20 @@ class TuningConfig(BaseHummingConfig):
                 self.smem_reuse_mode = SmemReuseMode.NONE
         self.smem_reuse_mode = SmemReuseMode(self.smem_reuse_mode)
         assert self.block_shape[0] <= 256
+        for name in ("producer_stage_unroll", "consumer_stage_unroll"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError(f"{name} must be None or a positive integer")
+        producer_registers = self.producer_registers
+        if producer_registers is not None:
+            is_valid = type(producer_registers) is int and 24 <= producer_registers <= 248
+            if not is_valid or producer_registers % 8:
+                raise ValueError("producer_registers must be None or a multiple of 8 between 24 and 248")
+        self.consumer_registers: int | None = None
+        if self.producer_stage_unroll is None:
+            self.producer_stage_unroll = self.num_stages
+        if self.consumer_stage_unroll is None:
+            self.consumer_stage_unroll = self.num_stages
         assert 0 <= self.output_chunk_rows <= 256 and self.output_chunk_rows % 32 == 0, (
             "output_chunk_rows must be 0 or a multiple of 32 up to 256"
         )

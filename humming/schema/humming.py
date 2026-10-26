@@ -337,7 +337,7 @@ class HummingWeightSchema(BaseWeightSchema):
                 shape_n_stacks=shape_n_stacks,
                 shape_k_stacks=shape_k_stacks,
                 num_experts=num_experts,
-                target_group_size=schema.weight_scale_group_size,
+                target_group_size=schema.weight_scale_group_size if len(shape_k_stacks) > 1 else None,
             )
 
             if tensor_scale.nelement() == (num_experts or 1):
@@ -345,9 +345,16 @@ class HummingWeightSchema(BaseWeightSchema):
                 if is_tensor_only:
                     schema.bs_dtype = dtypes.float32
             elif is_tensor_only:
-                schema.weight_scale_type = WeightScaleType.CHANNEL
+                if len(shape_k_stacks) > 1:
+                    schema.weight_scale_type = WeightScaleType.GROUP
+                    schema.weight_scale_group_size = sum(shape_k_stacks) // tensor_scale.size(-1)
+                else:
+                    schema.weight_scale_type = WeightScaleType.CHANNEL
                 schema.bs_dtype = dtypes.DataType.from_torch_dtype(param_dtype)
                 tensors["weight_scale"] = tensor_scale.to(param_dtype)
+            elif self.weight_scale_type == WeightScaleType.GROUP and len(shape_n_stacks) > 1:
+                schema.weight_scale_2_type = WeightScale2Type.CHANNEL
+                tensors["weight_scale_2"] = tensor_scale.squeeze(-1).to(param_dtype)
             else:
                 schema.weight_scale_2_type = WeightScale2Type.NONE
                 weight_scale = tensors["weight_scale"]
@@ -476,13 +483,16 @@ def is_humming_schema_compatible(
     b_dtype = weight_schema.b_dtype
     bs_dtype = weight_schema.bs_dtype or dtypes.DataType.from_torch_dtype(param_dtype)
     has_zero_point = weight_schema.has_zero_point
+    is_e0m_weight = b_dtype.is_floating_point_type and b_dtype.exponent_bits == 0
+    if a_dtype.is_integer_type and is_e0m_weight:
+        b_dtype = dtypes.IntegerType(num_bits=b_dtype.num_bits)
     mma_b_dtype = get_mma_b_dtype(a_dtype, b_dtype, has_zero_point, sm_version)
 
     dtype_min_sm_version_map = {
         dtypes.float16: 75,
         dtypes.bfloat16: 80,
         dtypes.int8: 75,
-        dtypes.int4: 80,
+        dtypes.int4: 75,
         dtypes.float8e4m3: 89,
         dtypes.float8e5m2: 89,
         dtypes.float8e3m4: 100,
@@ -502,11 +512,7 @@ def is_humming_schema_compatible(
     is_mxfp4_weight = b_dtype == dtypes.float4e2m1 and bs_dtype == dtypes.float8e8m0
     is_mxfp4_weight = is_mxfp4_weight and weight_schema.weight_scale_group_size == 32
 
-    is_e0m_weight = b_dtype.is_floating_point_type and b_dtype.exponent_bits == 0
-    if a_dtype.is_integer_type and is_e0m_weight:
-        if a_dtype != dtypes.int8 or b_dtype.num_bits >= 8 or has_zero_point:
-            return False
-    elif a_dtype == dtypes.int4:
+    if a_dtype == dtypes.int4:
         if not b_dtype.is_integer_type or b_dtype.num_bits > 4:
             return False
         if b_dtype in [dtypes.int4, dtypes.uint4] and has_zero_point:

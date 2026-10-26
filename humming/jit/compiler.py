@@ -64,6 +64,9 @@ class Compiler:
         flags = cls.get_flags(sm_version, disable_fast_math)
         signature = f"{cls.__name__}$${cls.signature()}$${flags}$${kernel_expr}$${code}"
         signature += "$$" + Compiler.cuh_last_update_time()
+        if postprocess_cubin is not None:
+            patcher = Path(__file__).parents[1] / "csrc/patch_cubin.cpp"
+            signature += "$$" + jit_utils.hash_path_content(str(patcher), releative=True, text_only=True)
         hash_hex = jit_utils.hash_to_hex(signature)
 
         cache_dirname = Path(os.path.join(jit_utils.get_humming_cache_dir(), hash_hex))

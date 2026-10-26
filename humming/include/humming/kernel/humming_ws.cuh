@@ -23,27 +23,6 @@ public:
 CUDA_INLINE const void *param_to_ptr(const CUtensorMap &x) { return &x; }
 CUDA_INLINE const void *param_to_ptr(void *const &x) { return x; }
 
-template <class Ctx, class MMA>
-struct WarpSpecializationRegisterAllocation {
-  using TuningConfig = typename Ctx::TuningConfig;
-  using ElementA = typename Ctx::ElementA;
-
-  static constexpr uint32_t kLoadThreadRegisters = TuningConfig::kNumMathThreads > 256 || (TuningConfig::kNumCtasPerSm == 1 && ElementA::kBits != 16) ? 40 : 24;
-  static constexpr uint32_t kAccumulatorRegistersPerThread = sizeof(typename MMA::CRegistersArrayType) / sizeof(uint32_t) * (MMA::final_regs_c_index() + 1);
-  static constexpr uint32_t kEstimatedMathThreadRegisters = MIN(232, MAX(128, kAccumulatorRegistersPerThread * 2 + 96));
-  // setmaxnreg requires multiples of eight; the physical budget below is rounded down.
-  static constexpr uint32_t kPreferredMathThreadRegisters = TuningConfig::kNumMathThreads > 256 ? 96 : CEIL_DIV(kEstimatedMathThreadRegisters, 8) * 8;
-  static constexpr uint32_t kNumWarps = TuningConfig::kNumThreads / 32;
-  static constexpr uint32_t kRegisterAllocationGranularityPerWarp = 256;
-  static constexpr uint32_t kRegisterBudgetPerWarp =
-      (64 * 1024) / (kNumWarps * TuningConfig::kNumCtasPerSm) /
-      kRegisterAllocationGranularityPerWarp * kRegisterAllocationGranularityPerWarp;
-  static constexpr uint32_t kRegisterBudgetPerCta = kRegisterBudgetPerWarp * kNumWarps;
-  static constexpr uint32_t kLoadThreadRegisterUsage = TuningConfig::kNumLoadThreads * kLoadThreadRegisters;
-  static constexpr uint32_t kRegistersAvailableForMath = kRegisterBudgetPerCta > kLoadThreadRegisterUsage ? kRegisterBudgetPerCta - kLoadThreadRegisterUsage : 0;
-  static constexpr uint32_t kMathThreadRegisters = MIN(kPreferredMathThreadRegisters, MAX(24, kRegistersAvailableForMath / TuningConfig::kNumMathThreads / 8 * 8));
-};
-
 template <
     class MmaOpClass,
     class ProblemShape, class BlockShape, class WarpShape, class PadShape,
@@ -83,14 +62,13 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       ElementA, ElementQB, ElementC, ElementBS,
       LayerConfig, ComputeConfig, TuningConfig>;
   using Scheduler = Scheduler<Ctx>;
-  using ProducerPipeline = ProducerPipeline<Ctx>;
-  using ConsumerPipeline = ConsumerPipeline<Ctx>;
+  using ProducerPipeline = ProducerPipeline<Ctx, kSmemReuseMode == SmemReuseMode::NONE>;
+  using ConsumerPipeline = ConsumerPipeline<Ctx, ProducerPipeline::kUseContinuousRing>;
   using MainloopArithmetic = MainloopArithmetic<Ctx>;
   using EpilogueArithmetic = EpilogueArithmetic<Ctx>;
   using MMA = Mma<Ctx, MainloopArithmetic>;
   using Epilogue = EpiloguePipeline<Ctx, MMA, EpilogueArithmetic>;
   using S2RMemoryPipeline = S2RMemoryPipeline<Ctx, MMA, Epilogue>;
-  using RegisterAllocation = WarpSpecializationRegisterAllocation<Ctx, MMA>;
 
   extern __shared__ int4 shared_memory[];
   auto &smem = *reinterpret_cast<SharedStorage *>(shared_memory);
@@ -111,7 +89,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
   bool pdl_waited = false;
 
   if (ctx.is_load_thread()) {
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(RegisterAllocation::kLoadThreadRegisters));
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(TuningConfig::kProducerRegisters));
 
     auto producer = ProducerPipeline(ctx);
     if constexpr (Ctx::kIsIndexedGemm) producer.wait_math_epilogue();
@@ -131,38 +109,38 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           pdl_waited = true;
         }
       }
+      producer.wait_stage(0, ProducerPipeline::kUseContinuousRing);
       producer.load_stage<true, true>(0);
-      PRAGMA_UNROLL
-      for (uint32_t stage_id = 1; stage_id < MAX(kNumStages - 1, 2); stage_id++) {
+      unroll_for<1, MAX(kNumStages - 1, 2), TuningConfig::kProducerStageUnroll>([&](uint32_t stage_id) {
+        producer.wait_stage(stage_id, ProducerPipeline::kUseContinuousRing && stage_id < slice_iters);
         producer.load_stage(stage_id, stage_id < slice_iters);
-      };
+      });
 
       constexpr uint32_t kStaticSliceIters = ProblemShape::K / BlockShape::K;
       const uint32_t num_slice_iters = Ctx::kUseStreamK ? slice_iters : kStaticSliceIters;
-      auto produce_stage = [&](auto stage, uint32_t slice_iter) {
-        constexpr uint32_t stage_id = decltype(stage)::value;
+      auto produce_stage = [&](uint32_t stage_id, uint32_t slice_iter) {
         debug_kernel_timeout_check(debug_start_clock);
         const uint32_t remaining_iters = num_slice_iters - slice_iter;
         if (remaining_iters == 1) producer.load_channel();
-        producer.wait_stage(stage_id);
+        const bool has_next_stage = kNumStages == 2 ? remaining_iters > kNumStages : remaining_iters >= kNumStages;
+        producer.wait_stage(stage_id, !ProducerPipeline::kUseContinuousRing || has_next_stage);
         if constexpr (kNumStages == 2) {
-          producer.load_stage(stage_id, remaining_iters > kNumStages);
+          producer.load_stage(stage_id, has_next_stage);
         } else {
-          producer.load_stage(stage_id + kNumStages - 1, remaining_iters >= kNumStages);
+          producer.load_stage(stage_id + kNumStages - 1, has_next_stage);
         }
       };
 
       const uint32_t num_full_stage_cycles = num_slice_iters / kNumStages;
       for (uint32_t cycle_id = 0; cycle_id < num_full_stage_cycles; cycle_id++) {
-        static_for<0, kNumStages>([&](auto stage) {
-          produce_stage(stage, cycle_id * kNumStages + decltype(stage)::value);
+        unroll_for<0, kNumStages, TuningConfig::kProducerStageUnroll>([&](uint32_t stage_id) {
+          produce_stage(stage_id, cycle_id * kNumStages + stage_id);
         });
       }
       const uint32_t tail_stage_iters = num_slice_iters % kNumStages;
-      static_for<0, kNumStages>([&](auto stage) {
-        constexpr uint32_t stage_id = decltype(stage)::value;
+      unroll_for<0, kNumStages, TuningConfig::kProducerStageUnroll>([&](uint32_t stage_id) {
         if (stage_id < tail_stage_iters) {
-          produce_stage(stage, num_full_stage_cycles * kNumStages + stage_id);
+          produce_stage(stage_id, num_full_stage_cycles * kNumStages + stage_id);
         }
       });
       if constexpr (Ctx::kIsIndexedGemm) {
@@ -171,7 +149,7 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       }
     }
   } else {
-    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegisterAllocation::kMathThreadRegisters));
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(TuningConfig::kConsumerRegisters));
 
     auto mainloop_arith = MainloopArithmetic();
     auto epilogue_arith = EpilogueArithmetic();
@@ -192,13 +170,13 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
       s2r_pipe.seek(scheduler.m_offset);
 
       consumer.wait_stage<true>(kNumStages);
-      s2r_pipe.load_stage_iter<true>(0, 0);
+      s2r_pipe.load_stage_iter<true>(consumer.get_stage_id(0), 0);
       mma.transform_b(0, 0);
 
       constexpr uint32_t kStaticSliceIters = ProblemShape::K / BlockShape::K;
       const uint32_t num_slice_iters = Ctx::kUseStreamK ? slice_iters : kStaticSliceIters;
-      auto consume_stage = [&](auto stage, uint32_t slice_iter) {
-        constexpr uint32_t stage_id = decltype(stage)::value;
+      auto consume_stage = [&](uint32_t logical_stage_id, uint32_t slice_iter) {
+        const uint32_t stage_id = consumer.get_stage_id(logical_stage_id);
         debug_kernel_timeout_check(debug_start_clock);
         PRAGMA_UNROLL
         for (uint32_t warp_iter_id = 0; warp_iter_id < Ctx::kWarpIters; warp_iter_id++) {
@@ -211,35 +189,49 @@ __global__ __launch_bounds__(TuningConfig::kNumThreads, TuningConfig::kNumCtasPe
           if (warp_iter_id == Ctx::kWarpIters - 1 && slice_iter + 1 < num_slice_iters) {
             consumer.wait_stage((stage_id + 1) % kNumStages);
           }
+          if constexpr (!Ctx::kUseWgmma) {
+            if (warp_iter_id == Ctx::kWarpIters - 1) {
+              if constexpr (Ctx::kWarpIters > 1 && ProducerPipeline::kHasStageTmaMBarrier)
+                asm volatile("fence.acq_rel.cta;" ::: "memory");
+              consumer.arrive(stage_id);
+            }
+          }
           const bool use_late_scale_prefetch = Ctx::kUseWgmmaLateScalePrefetch && warp_iter_id == Ctx::kWarpIters - 1;
-          if (use_late_scale_prefetch)
-            s2r_pipe.load_stage_iter_data(stage_id, warp_iter_id + 1);
-          else
-            s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
+          const bool has_next_fragment = warp_iter_id + 1 < Ctx::kWarpIters || slice_iter + 1 < num_slice_iters;
+          if (has_next_fragment) {
+            if (use_late_scale_prefetch)
+              s2r_pipe.load_stage_iter_data(stage_id, warp_iter_id + 1);
+            else
+              s2r_pipe.load_stage_iter(stage_id, warp_iter_id + 1);
+          }
           if constexpr (Ctx::kWgmmaSplitIssueWait)
             mma.wait_and_promote(stage_id, warp_iter_id);
           else if constexpr (Ctx::kWarpIters > 1)
             mma.run(stage_id, warp_iter_id);
-          if (use_late_scale_prefetch)
-            s2r_pipe.load_stage_iter_scales(stage_id, warp_iter_id + 1);
-          mma.transform_b(
-              ((warp_iter_id + 1) % Ctx::kWarpIters) % 2,
-              (warp_iter_id + 1) % Ctx::kWarpIters);
-          if (warp_iter_id == Ctx::kWarpIters - 1) consumer.arrive(stage_id);
+          if (has_next_fragment) {
+            if (use_late_scale_prefetch)
+              s2r_pipe.load_stage_iter_scales(stage_id, warp_iter_id + 1);
+            mma.transform_b(
+                ((warp_iter_id + 1) % Ctx::kWarpIters) % 2,
+                (warp_iter_id + 1) % Ctx::kWarpIters);
+          }
+          if constexpr (Ctx::kUseWgmma) {
+            if (warp_iter_id == Ctx::kWarpIters - 1) consumer.arrive(stage_id);
+          }
         }
       };
 
-      const uint32_t num_full_stage_cycles = num_slice_iters / kNumStages;
+      constexpr uint32_t kStageCycleIters = ProducerPipeline::kUseContinuousRing ? MIN(kNumStages, kStaticSliceIters) : kNumStages;
+      const uint32_t num_full_stage_cycles = num_slice_iters / kStageCycleIters;
       for (uint32_t cycle_id = 0; cycle_id < num_full_stage_cycles; cycle_id++) {
-        static_for<0, kNumStages>([&](auto stage) {
-          consume_stage(stage, cycle_id * kNumStages + decltype(stage)::value);
+        unroll_for<0, kStageCycleIters, TuningConfig::kConsumerStageUnroll>([&](uint32_t stage_id) {
+          consume_stage(stage_id, cycle_id * kStageCycleIters + stage_id);
         });
       }
-      const uint32_t tail_stage_iters = num_slice_iters % kNumStages;
-      static_for<0, kNumStages>([&](auto stage) {
-        constexpr uint32_t stage_id = decltype(stage)::value;
+      const uint32_t tail_stage_iters = num_slice_iters % kStageCycleIters;
+      unroll_for<0, kStageCycleIters, TuningConfig::kConsumerStageUnroll>([&](uint32_t stage_id) {
         if (stage_id < tail_stage_iters) {
-          consume_stage(stage, num_full_stage_cycles * kNumStages + stage_id);
+          consume_stage(stage_id, num_full_stage_cycles * kStageCycleIters + stage_id);
         }
       });
 

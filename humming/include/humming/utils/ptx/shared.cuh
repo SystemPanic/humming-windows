@@ -23,6 +23,32 @@ CUDA_INLINE void ld_shared(const int4 *smem_ptr, int4 *regs_ptr) {
   }
 }
 
+template <int kSourceBits, int count>
+CUDA_INLINE void ld_shared_dequant(uint32_t smem, uint32_t *a) {
+  static_assert(kSourceBits == 2 || kSourceBits == 4);
+  static_assert(count == 2 || count == 4);
+#if defined(HUMMING_USE_NATIVE_LDMATRIX_DEQUANT) && HUMMING_USE_NATIVE_LDMATRIX_DEQUANT
+  if constexpr (kSourceBits == 4) {
+    if constexpr (count == 4) {
+      asm volatile("ldmatrix.sync.aligned.m8n16.x4.shared.s8.s4 {%0,%1,%2,%3}, [%4];"
+          : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem));
+    } else {
+      asm volatile("ldmatrix.sync.aligned.m8n16.x2.shared.s8.s4 {%0,%1}, [%2];"
+          : "=r"(a[0]), "=r"(a[1]) : "r"(smem));
+    }
+    return;
+  }
+#endif
+  // Transposed loads are reserved for integer-expansion placeholders in this kernel.
+  if constexpr (count == 4) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+        : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(smem));
+  } else {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
+        : "=r"(a[0]), "=r"(a[1]) : "r"(smem));
+  }
+}
+
 template <int count, bool kTranspose = false>
 CUDA_INLINE void st_shared(uint32_t smem, const uint32_t *a) {
   if constexpr (count == 4) {

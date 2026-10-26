@@ -56,7 +56,7 @@ def _stage_storage_bytes(
     expand_low_bit_weight = use_umma_ss and a_bits == 8 and b_bits < 8
     weight_k_alignment = math.gcd(block_k, 128)
     weight_stage_k = round_up(block_k + 128 - weight_k_alignment, 128) if expand_low_bit_weight else block_k
-    weight_alignment = 1024 if layer_config.use_raw_weight else 128
+    weight_alignment = 1024 if layer_config.use_raw_weight or layer_config.use_flat_weight else 128
     weight_stage_n = max(block_n, 128) if use_umma_ss else block_n
     fields.append((weight_stage_n * weight_stage_k * weight_smem_bits // 8, weight_alignment))
 

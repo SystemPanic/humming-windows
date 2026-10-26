@@ -155,6 +155,12 @@ public:
   static constexpr uint32_t kWarpReduceBuffers = kNumWarpsDimK <= 4 ? kNumWarpsDimK - 1 : kNumWarpsDimK / 2;
   static constexpr uint32_t kWarpReduceSize = M_WARPS * 16 * BlockShape::N * kMmaCTypeBits / 128 * kWarpReduceBuffers;
   static constexpr uint32_t kOutputRows = TuningConfig::kOutputChunkRows ? MIN(TuningConfig::kOutputChunkRows, BlockShape::M) : BlockShape::M;
+  static constexpr uint32_t kNumOutputWarpgroups = M_WARPS * (BlockShape::N / WarpShape::N) / 4;
+  static constexpr bool kUseWarpgroupOutput = TuningConfig::kMmaType == MmaType::WGMMA && kNumOutputWarpgroups > 1 && !TuningConfig::kOutputChunkRows;
+  static constexpr uint32_t kNumStreamKLocksPerTile = kUseWarpgroupOutput ? kNumOutputWarpgroups : 1;
+  static constexpr uint32_t kOutputTileRows = kUseWarpgroupOutput ? WarpShape::M : kOutputRows;
+  static constexpr uint32_t kWarpgroupStoreColumns = M_WARPS == 1 ? WarpShape::N * 4 : 64;
+  static constexpr uint32_t kOutputTileColumns = kUseWarpgroupOutput ? kWarpgroupStoreColumns : (TuningConfig::kMmaType == MmaType::UMMA && TuningConfig::kOutputChunkRows ? 128 : BlockShape::N);
   static constexpr bool kUseDynamicOutputMap = TuningConfig::kUseTmaC && (kIsGroupedGemm || BlockShape::M % kOutputRows != 0);
   static constexpr uint32_t kOutputBuffers = TuningConfig::kMmaType == MmaType::UMMA && TuningConfig::kOutputChunkRows ? 2 : 1;
   static constexpr uint32_t kBlockOutputSize = kOutputBuffers * kOutputRows * BlockShape::N / 8;
@@ -233,7 +239,7 @@ public:
   static constexpr bool kUseWarpSpec = TuningConfig::kUseWarpSpec;
   struct StageStorage {
     alignas(1024) int4 a[kStageSizeA];
-    alignas(LayerConfig::kUseRawWeight ? 1024 : 128) int4 b[kStageSizeB];
+    alignas(LayerConfig::kUseRawWeight || LayerConfig::kUseFlatWeight ? 1024 : 128) int4 b[kStageSizeB];
     IF_HAS_STAGE_INPUT_SCALE(alignas(128) int4 as[kStageSizeAS];)
     IF_HAS_STAGE_WEIGHT_SCALE(alignas(128) int4 bs[kStageSizeBS];)
     IF_HAS_STAGE_ZERO_POINT(alignas(128) int4 bzp[kStageSizeBZP];)

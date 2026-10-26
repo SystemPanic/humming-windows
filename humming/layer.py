@@ -98,6 +98,7 @@ class HummingLayerMethod:
         has_bias: bool = False,
         torch_dtype: torch.dtype | None = None,
         sublayer_name: str = "",
+        tensors: dict[str, torch.Tensor] | None = None,
     ) -> HummingLayerMeta:
         device = next((param.device for param in layer.parameters() if param.is_cuda), None)
         config = prepare_layer_config(
@@ -111,6 +112,7 @@ class HummingLayerMethod:
             has_bias=has_bias,
             torch_dtype=torch_dtype,
             device=device,
+            tensors=tensors,
         )
         meta = HummingLayerMeta.from_layer_config(config, sublayer_name)
 
@@ -378,7 +380,7 @@ class HummingLayer(torch.nn.Module):
 
         # Stream-K synchronization state must not be shared between layers:
         # separate layers may execute concurrently on different CUDA streams.
-        locks = torch.zeros((1024,), dtype=torch.int32, device=torch.cuda.current_device())
+        locks = torch.zeros((2048,), dtype=torch.int32, device=torch.cuda.current_device())
         self.register_buffer("locks", locks)
 
     @property
@@ -635,6 +637,11 @@ class HummingLayer(torch.nn.Module):
             for name in ("weight", "zero_point"):
                 if name in weight_tensors:
                     setattr(self, name, torch.nn.Parameter(weight_tensors[name], requires_grad=False))
+        tensors = {
+            name: tensor
+            for name in ["weight", "weight_scale", "zero_point", "bias", "weight_scale_2"]
+            if (tensor := getattr(self, name, None)) is not None
+        }
         self.humming_config = prepare_layer_config(
             shape_n=self.shape_n,
             shape_k=self.shape_k,
@@ -646,14 +653,10 @@ class HummingLayer(torch.nn.Module):
             torch_dtype=self.torch_dtype,
             has_bias=self.has_bias,
             device=device,
+            tensors=tensors,
         )
         self._humming_metas = {}
 
-        tensors = {
-            name: tensor
-            for name in ["weight", "weight_scale", "zero_point", "bias", "weight_scale_2"]
-            if (tensor := getattr(self, name, None)) is not None
-        }
         self.humming_config, tensors = prepare_fp16_e8m0_scale(self.humming_config, tensors)
         tensors = transform_humming_tensors(self.humming_config, tensors)
         for name, tensor in tensors.items():

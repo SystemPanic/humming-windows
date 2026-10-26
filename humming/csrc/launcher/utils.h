@@ -144,6 +144,9 @@ struct KernelData {
   uint32_t num_ctas_per_sm;
   uint32_t umma_cta_group_size;
   uint32_t output_chunk_rows;
+  uint32_t output_tile_rows;
+  uint32_t output_tile_columns;
+  uint32_t num_stream_k_locks_per_tile;
   uint32_t multi_cast_size_a;
   uint32_t multi_cast_size_b;
   uint32_t gemm_type_id;
@@ -176,6 +179,8 @@ struct KernelData {
   bool use_packed_k_layout;
   bool use_umma_ss;
   bool use_raw_weight;
+  bool use_flat_weight;
+  bool use_ldmatrix_dequant;
   bool use_block_scaled_mma;
 };
 
